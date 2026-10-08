@@ -1,0 +1,253 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-display: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --color-youtube: #FF0000;
+  --color-tiktok: #00F2EA;
+  --color-douyin: #FE2C55;
+  --color-facebook: #1877F2;
+  --color-instagram: #E1306C;
+  --color-bilibili: #00A1D6;
+  --color-vimeo: #1AB7EA;
+  --color-pinterest: #E60023;
+  --color-xiaohongshu: #FF2442;
+}
+
+:root {
+  --accent: #ffffff;
+  --accent-rgb: 255, 255, 255;
+  --accent-text: #050505;
+  --accent-gradient: linear-gradient(135deg, #ffffff 0%, #a3a3a3 100%);
+  --accent-glow: rgba(255, 255, 255, 0.15);
+}
+
+[data-provider="youtube"] {
+  --accent: #FF0000;
+  --accent-rgb: 255, 0, 0;
+  --accent-text: #ffffff;
+  --accent-gradient: linear-gradient(135deg, #FF0000 0%, #B30000 100%);
+  --accent-glow: rgba(255, 0, 0, 0.25);
+}
+
+[data-provider="tiktok"] {
+  --accent: #00F2EA;
+  --accent-rgb: 0, 242, 234;
+  --accent-text: #050505;
+  --accent-gradient: linear-gradient(135deg, #00F2EA 0%, #FF007F 100%);
+  --accent-glow: rgba(0, 242, 234, 0.25);
+}
+
+[data-provider="facebook"] {
+  --accent: #1877F2;
+  --accent-rgb: 24, 119, 242;
+  --accent-text: #ffffff;
+  --accent-gradient: linear-gradient(135deg, #1877F2 0%, #0d53b5 100%);
+  --accent-glow: rgba(24, 119, 242, 0.25);
+}
+
+[data-provider="instagram"] {
+  --accent: #E1306C;
+  --accent-rgb: 225, 48, 108;
+  --accent-text: #ffffff;
+  --accent-gradient: linear-gradient(135deg, #833AB4 0%, #FD1D1D 50%, #F56040 100%);
+  --accent-glow: rgba(225, 48, 108, 0.25);
+}
+
+[data-provider="bilibili"] {
+  --accent: #00A1D6;
+  --accent-rgb: 0, 161, 214;
+  --accent-text: #ffffff;
+  --accent-gradient: linear-gradient(135deg, #00A1D6 0%, #00779e 100%);
+  --accent-glow: rgba(0, 161, 214, 0.25);
+}
+
+[data-provider="twitter"] {
+  --accent: #1DA1F2;
+  --accent-rgb: 29, 161, 242;
+  --accent-text: #ffffff;
+  --accent-gradient: linear-gradient(135deg, #1DA1F2 0%, #0d8ddb 100%);
+  --accent-glow: rgba(29, 161, 242, 0.25);
+}
+
+[data-provider="reddit"] {
+  --accent: #FF4500;
+  --accent-rgb: 255, 69, 0;
+  --accent-text: #ffffff;
+  --accent-gradient: linear-gradient(135deg, #FF4500 0%, #cc3700 100%);
+  --accent-glow: rgba(255, 69, 0, 0.25);
+}
+
+[data-provider="soundcloud"] {
+  --accent: #FF5500;
+  --accent-rgb: 255, 85, 0;
+  --accent-text: #ffffff;
+  --accent-gradient: linear-gradient(135deg, #FF5500 0%, #cc4400 100%);
+  --accent-glow: rgba(255, 85, 0, 0.25);
+}
+
+[data-provider="vimeo"] {
+  --accent: #1AB7EA;
+  --accent-rgb: 26, 183, 234;
+  --accent-text: #ffffff;
+  --accent-gradient: linear-gradient(135deg, #1AB7EA 0%, #1193bd 100%);
+  --accent-glow: rgba(26, 183, 234, 0.25);
+}
+
+[data-provider="douyin"] {
+  --accent: #FE2C55;
+  --accent-rgb: 254, 44, 85;
+  --accent-text: #ffffff;
+  --accent-gradient: linear-gradient(135deg, #FE2C55 0%, #25F4EE 100%);
+  --accent-glow: rgba(254, 44, 85, 0.28);
+}
+
+[data-provider="pinterest"] {
+  --accent: #E60023;
+  --accent-rgb: 230, 0, 35;
+  --accent-text: #ffffff;
+  --accent-gradient: linear-gradient(135deg, #E60023 0%, #ad001a 100%);
+  --accent-glow: rgba(230, 0, 35, 0.25);
+}
+
+[data-provider="xiaohongshu"] {
+  --accent: #FF2442;
+  --accent-rgb: 255, 36, 66;
+  --accent-text: #ffffff;
+  --accent-gradient: linear-gradient(135deg, #FF2442 0%, #FF6079 100%);
+  --accent-glow: rgba(255, 36, 66, 0.28);
+}
+
+body {
+  background-color: #030303;
+  color: #F3F4F6;
+  margin: 0;
+  font-family: var(--font-sans);
+  overflow-x: clip;
+  position: relative;
+}
+
+/* Fixed background grid stays aligned while the page scrolls. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image: 
+    linear-gradient(rgba(255, 255, 255, 0.015) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.015) 1px, transparent 1px);
+  background-size: 40px 40px;
+  background-position: center center;
+  pointer-events: none;
+  z-index: -20;
+}
+
+/* Shared glass surface treatment; component utilities can still set radius. */
+@layer components {
+  .glass-panel {
+    isolation: isolate;
+    background: rgba(10, 10, 10, 0.65);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  }
+
+  .glass-panel:hover {
+    border-color: rgba(var(--accent-rgb), 0.2);
+    box-shadow: 0 12px 32px 0 rgba(var(--accent-rgb), 0.04), 0 8px 24px 0 rgba(0, 0, 0, 0.32);
+  }
+}
+
+/* Shimmer pulse effect */
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.animate-shimmer {
+  background: linear-gradient(90deg, rgba(255,255,255,0.03) 25%, rgba(255,255,255,0.08) 50%, rgba(255,255,255,0.03) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.8s infinite linear;
+}
+
+/* Accent Button */
+.btn-accent {
+  background: var(--accent-gradient);
+  color: var(--accent-text);
+  box-shadow: 0 4px 14px 0 var(--accent-glow);
+  transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+  font-weight: 700;
+}
+
+.btn-accent:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px 0 var(--accent-glow), 0 0 12px rgba(var(--accent-rgb), 0.2);
+}
+
+.btn-accent:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+/* Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(var(--accent-rgb), 0.4);
+}
+
+/* Safe Area Padding for iOS & Mobile Gestures */
+.safe-area-pb {
+  padding-bottom: max(0.65rem, env(safe-area-inset-bottom, 0px));
+}
+
+/* GPU Hardware Acceleration for 60fps Scroll Experience */
+.transform-gpu {
+  will-change: transform;
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
+
+/* Accessibility: Universal Focus Ring */
+*:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Accessibility: Reduced Motion Support */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto !important;
+  }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (max-width: 640px) {
+  .glass-panel {
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.28);
+  }
+}

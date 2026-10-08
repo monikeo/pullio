@@ -1,0 +1,6 @@
+{
+  "name": "Pullio",
+  "description": "Universal video and audio downloader and converter.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

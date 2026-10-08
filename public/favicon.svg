@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">Pullio</title>
+  <rect width="512" height="512" rx="112" fill="#111318"/>
+  <path fill="#F7F7F5" fill-rule="evenodd" d="M103 416V96h160c94 0 146 50 146 134S357 364 263 364h-74v52h-86Zm86-122h70c42 0 64-22 64-64s-22-64-64-64h-70v128Z"/>
+  <path d="m239 208 54 22-54 22v-44Z" fill="#F97316"/>
+</svg>
