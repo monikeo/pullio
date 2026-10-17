@@ -16,11 +16,69 @@
 }
 
 :root {
+  --bg-base: #030303;
+  --studio-surface: #0b0b0b;
+  --studio-border: rgba(255, 255, 255, 0.15);
+  --studio-overlay: rgba(0, 0, 0, 0.8);
+  --studio-shadow: rgba(0, 0, 0, 0.5);
   --accent: #ffffff;
   --accent-rgb: 255, 255, 255;
   --accent-text: #050505;
   --accent-gradient: linear-gradient(135deg, #ffffff 0%, #a3a3a3 100%);
   --accent-glow: rgba(255, 255, 255, 0.15);
+}
+
+.audio-studio-dialog {
+  margin: auto;
+  width: min(860px, calc(100% - 2rem));
+  max-width: none;
+  max-height: calc(100dvh - 2rem);
+  padding: 0;
+  border: 1px solid var(--studio-border);
+  border-radius: 20px;
+  background: var(--studio-surface);
+  overflow: hidden;
+  overscroll-behavior: contain;
+  box-shadow: 0 24px 80px var(--studio-shadow);
+}
+
+.audio-studio-dialog::backdrop { background: var(--studio-overlay); }
+.audio-studio-surface { min-width: 0; height: min(900px, calc(100dvh - 2rem)); display: flex; flex-direction: column; }
+.audio-studio-content { min-height: 0; flex: 1; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.audio-studio-header p:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audio-studio-export { max-height: 30dvh; overflow-y: auto; }
+.audio-studio-range { min-height: 32px; cursor: pointer; }
+.audio-studio-range:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 4px; }
+.audio-studio-range:disabled { cursor: default; }
+
+@media (max-width: 480px) {
+  .audio-studio-dialog { width: 100%; max-height: 100dvh; border-radius: 0; border: 0; }
+  .audio-studio-surface { height: 100dvh; }
+  .audio-studio-header { padding-top: max(0.75rem, env(safe-area-inset-top)); }
+  .audio-studio-export { padding-bottom: max(0.75rem, env(safe-area-inset-bottom)); }
+}
+
+@media (max-width: 1023px) {
+  .app-header, .app-bottom-nav { transition: transform 180ms ease-out, opacity 180ms ease-out; }
+  .app-header[data-scroll-hidden="true"] { transform: translate3d(0, -110%, 0); }
+  .app-bottom-nav[data-scroll-hidden="true"] { transform: translate3d(0, 110%, 0); opacity: 0; pointer-events: none; }
+  .app-header:has(:focus-visible), .app-bottom-nav:has(:focus-visible) { transform: translate3d(0, 0, 0); opacity: 1; pointer-events: auto; }
+}
+
+@media (max-width: 359px) {
+  .app-bottom-nav > button { min-width: 0; padding-inline: 2px; }
+  .app-bottom-nav > button > span { font-size: 9px; letter-spacing: 0.025em; }
+}
+
+/* A landscape phone needs document-style scrolling to keep every control
+   reachable when the player and the keyboard take most of the viewport. */
+@media (max-height: 600px) {
+  .audio-studio-dialog { overflow-y: auto; }
+  .audio-studio-surface { height: auto; }
+  .audio-studio-content { flex: none; overflow: visible; }
+  .audio-studio-header { position: sticky; top: 0; z-index: 10; }
+  .audio-studio-export { position: sticky; bottom: 0; z-index: 10; }
+  .audio-studio-surface canvas { display: none; }
 }
 
 [data-provider="youtube"] {

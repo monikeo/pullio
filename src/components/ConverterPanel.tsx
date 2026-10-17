@@ -5,7 +5,7 @@ import {
   Repeat, Upload, FileVideo, FileAudio, Check, AlertCircle, 
   Loader2, Download, Trash2, ArrowRight, Sparkles, Layers,
   Sliders, Music, Video, RefreshCw, X, Play, HardDrive, Zap,
-  CheckCircle2, ChevronDown
+  CheckCircle2, ChevronDown, AudioLines
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { TargetMediaFormat, ConversionItem, ConversionOptions } from '../types';
@@ -103,7 +103,8 @@ export default function ConverterPanel() {
     clearConversionQueue, 
     setBatchTargetFormat,
     ensureWebSocketConnected,
-    subscribeConversionJobs
+    subscribeConversionJobs,
+    setAudioStudioSource
   } = useAppStore();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -671,6 +672,18 @@ export default function ConverterPanel() {
                       </div>
 
                       {/* Customize button */}
+                      {item.options.targetFormat !== 'gif' && ['idle', 'failed', 'completed'].includes(item.status) && (item.file || item.uploadId || item.status === 'completed') && (
+                        <button
+                          onClick={() => setAudioStudioSource(item.status === 'completed'
+                            ? { kind: 'conversion', id: item.id, name: item.convertedFileName || item.fileName }
+                            : item.uploadId ? { kind: 'upload', id: item.uploadId, name: item.fileName }
+                            : { kind: 'local', file: item.file!, name: item.fileName })}
+                          className="px-2.5 py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-xs font-bold text-neutral-200 flex items-center gap-1.5 min-h-[36px]"
+                          title="Preview and enhance this file’s audio"
+                        >
+                          <AudioLines className="size-3.5 text-[var(--accent)]" /> Enhance audio
+                        </button>
+                      )}
                       <button
                         onClick={() => setEditingItemId(editingItemId === item.id ? null : item.id)}
                         disabled={item.status === 'converting' || item.status === 'uploading'}

@@ -6,6 +6,8 @@ A high-performance, self-hosted media extraction and transcoding platform built 
 
 ## Key Highlights
 
+- **Audio Studio**: Choose **Enhance audio** on a local converter item, completed download, converted file, or history entry. Clean continuous noise with adaptive wavelet denoising, remove 50/60 Hz electrical hum, quiet pauses, repair clicks, and tame sibilance. Combine these with voice EQ, bass, clarity, and 0.5–2× speed with optional pitch preservation. Compare the original, then export MP3, WAV, FLAC, M4A, or OGG. Enhanced outputs remain in the converter queue. Server FFmpeg handles exports and cleanup previews using the original source and the existing two-worker conversion limit; closing the studio cancels unfinished processing.
+
 - **Multi-Platform Support**: Built-in extractors and cascade bypass configurations for **YouTube** (Videos, Shorts, Playlists), **TikTok**, **Douyin (抖音)**, **Facebook** (Watch, Reels, Shares), **Instagram** (Reels, Posts, Stories), **Bilibili (哔哩哔哩)**, **Vimeo**, **Pinterest**, **XiaoHongShu (小红书)**, **X (Twitter)**, and **SoundCloud**.
 - **Adaptive Multi-Tier Bypass Engine**: Built-in cascade retry mechanism that rotates client personas, headers, and player APIs (Web, Android, iOS Safari, mobile headers, and crawler bypasses) to circumvent 403 Forbidden, bot challenges, and rate limits.
 - **True Resolution & Aspect-Ratio Preservation**: Intelligent dimension matching that preserves Full HD vertical portrait videos (1080x1920 Instagram Reels & YouTube Shorts) without unintended downscaling, alongside full 4K (2160p), 2K (1440p), 1080p60, 720p, 480p, and 360p stream muxing.
@@ -36,6 +38,18 @@ A high-performance, self-hosted media extraction and transcoding platform built 
 ---
 
 ## System Requirements
+
+### Audio studio notes
+
+The studio uses native Web Audio for live tone/speed preview and existing server FFmpeg for cleanup and export; no browser FFmpeg download is needed. Noise reduction uses adaptive wavelet profiling (`afwtdn`) plus rumble filtering. Hum removal targets the selected 50/60 Hz frequency and its first four harmonics. Quiet pauses uses a noise gate; click repair uses `adeclick`; sibilance control uses `deesser`. Higher strength can soften speech, and aggressive gating can cut quiet words.
+
+Cleanup controls debounce for 700 ms, then render a WAV preview through the same cleanup filters used by export. The player retains its position across processed/original comparison. Pending settings are labeled clearly, stale jobs are cancelled, and export waits for the current cleanup preview. Tone and speed remain live in Web Audio. Voice focus is an equalizer, not AI vocal separation. Clarity cannot restore lost source detail. Browser and FFmpeg dynamics can differ slightly, and lossless export does not upgrade the source recording.
+
+The studio separates **Clean up**, **Tone & level**, and **Export** into keyboard-accessible tabs. The player and export action stay visible while settings scroll; short landscape screens use a scrolling dialog. Save and recall one personal settings preset on the current device. Loudness leveling uses FFmpeg `loudnorm` at −16, −14, or −23 LUFS before tone processing; output gain adjusts −12 to +12 dB with peak limiting. Later EQ and gain can change the final loudness, so the chosen LUFS value is a leveling target rather than a delivery compliance guarantee.
+
+MP3 supports 128/192/320 kbps, M4A and raw AAC/ADTS 128/256 kbps, OGG 192/320 kbps, Opus 128/192 kbps, WAV 16-bit/44.1 kHz or 24-bit/48 kHz, and FLAC lossless compression. The studio accepts server file IDs rather than arbitrary paths or remote media URLs. Temporary files expire after 15 minutes of inactivity; an open studio keeps its preview and source alive. Restart the server after updating Audio Studio backend code.
+
+Phones and portrait tablets use bottom navigation that hides during deliberate downward scrolling and returns on upward scrolling, focus, or reaching the page ends. Resizing or completing link analysis reveals navigation again. Footer platform and tool sections collapse on phones and stay expanded on larger screens. Motion respects the operating system’s reduced-motion preference.
 
 - **Node.js**: `v22.0.0` or higher (Node 22+ required for yt-dlp internal JavaScript execution and challenge solving).
 - **Operating System**: Windows 10/11, Linux (Ubuntu 20.04+, Debian 11+, Arch, Alpine), or macOS (Apple Silicon / Intel).

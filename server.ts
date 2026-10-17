@@ -11,6 +11,7 @@ import { execFile, spawn } from "child_process";
 import { promisify } from "util";
 import ffmpegPath from "ffmpeg-static";
 import multer from "multer";
+import { AudioEnhancementSettings, AudioExportFormat, buildAudioEnhancementFilters, buildAudioCleanupFilters, getAudioEncoderArgs, validateAudioEnhancement, validateAudioExport } from "./src/lib/audioEnhancement";
 
 const execFileAsync = promisify(execFile);
 
@@ -1113,6 +1114,9 @@ export interface ConversionJob {
   qualityPreset?: string;
   videoResolution?: string;
   audioBitrate?: string;
+  studioPurpose?: 'preview' | 'cleanup-preview' | 'enhancement';
+  enhancementSettings?: AudioEnhancementSettings;
+  exportQuality?: string;
   status: 'queued' | 'converting' | 'completed' | 'failed' | 'cancelled';
   progress: number;
   speed?: string;
@@ -1121,6 +1125,7 @@ export interface ConversionJob {
   outputPath?: string;
   outputFileName?: string;
   outputFileSize?: string;
+  outputBytes?: number;
   duration?: number;
   createdAt: number;
 }
@@ -1170,8 +1175,8 @@ function broadcastConvertUpdate(jobId: string, force = false) {
 
 function getMediaDuration(filePath: string): Promise<number> {
   return new Promise((resolve) => {
-    const args = ["-i", filePath];
-    execFile(ffmpegPath || "ffmpeg", args, (_err, _stdout, stderr) => {
+    const args = ["-protocol_whitelist", "file,pipe", "-i", filePath];
+    execFile(ffmpegPath || "ffmpeg", args, { timeout: 20_000, maxBuffer: 1024 * 1024 }, (_err, _stdout, stderr) => {
       const output = stderr || "";
       const durMatch = output.match(/Duration:\s*(\d+):(\d+):(\d+\.?\d*)/);
       if (durMatch) {
@@ -1233,21 +1238,33 @@ async function processConversionJob(jobId: string) {
       throw new Error("Input source file missing or removed from server.");
     }
 
-    const totalDuration = await getMediaDuration(job.inputPath);
+    const sourceDuration = await getMediaDuration(job.inputPath);
     if (conversionJobs.get(jobId) !== job) return;
+    const totalDuration = sourceDuration / (job.studioPurpose === 'enhancement' ? job.enhancementSettings?.speed || 1 : 1);
     job.duration = totalDuration;
 
-    const baseName = path.parse(job.originalName).name.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const baseName = path.parse(job.originalName).name.normalize('NFKC').replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").slice(0, 100) || 'audio';
     const targetExt = job.targetFormat.toLowerCase();
-    const outputFileName = `${baseName}_converted.${targetExt}`;
+    const suffix = job.studioPurpose === 'enhancement' ? 'enhanced' : job.studioPurpose === 'cleanup-preview' ? 'cleaned_preview' : job.studioPurpose === 'preview' ? 'preview' : 'converted';
+    const outputFileName = `${baseName}_${suffix}.${targetExt}`;
     const outputPath = path.join(CONVERTED_DIR, `${jobId}_${outputFileName}`);
     job.outputPath = outputPath;
     job.outputFileName = outputFileName;
 
     const AUDIO_FORMATS = ['mp3', 'wav', 'flac', 'aac', 'm4a', 'ogg', 'opus'];
-    const args: string[] = ["-y", "-i", job.inputPath];
+    const args: string[] = ["-y", "-nostdin", "-hide_banner", "-protocol_whitelist", "file,pipe", "-i", job.inputPath];
 
-    if (AUDIO_FORMATS.includes(targetExt)) {
+    if (job.studioPurpose) {
+      args.push('-map', '0:a:0', '-vn', '-map_metadata', '-1');
+      if (job.enhancementSettings) {
+        const filters = job.studioPurpose === 'cleanup-preview'
+          ? buildAudioCleanupFilters(job.enhancementSettings)
+          : buildAudioEnhancementFilters(job.enhancementSettings);
+        if (filters.length) args.push('-af', filters.join(','));
+      }
+      if (job.studioPurpose === 'preview' || job.studioPurpose === 'cleanup-preview') args.push('-c:a', 'pcm_s16le', '-ar', '48000', '-ac', '2');
+      else args.push(...getAudioEncoderArgs(targetExt as AudioExportFormat, job.exportQuality!));
+    } else if (AUDIO_FORMATS.includes(targetExt)) {
       args.push("-vn");
       const bitrate = job.audioBitrate || (job.qualityPreset?.includes('k') ? job.qualityPreset : '320k');
       if (targetExt === 'mp3') {
@@ -1302,7 +1319,7 @@ async function processConversionJob(jobId: string) {
     args.push(outputPath);
 
     log.info("CONVERT", `Starting conversion job ${jobId} -> ${targetExt}`);
-    const child = spawn(ffmpegPath || "ffmpeg", args);
+    const child = spawn(ffmpegPath || "ffmpeg", args, { timeout: 15 * 60 * 1000 });
     activeConversionProcesses.set(jobId, child);
 
     let stderrData = "";
@@ -1316,7 +1333,7 @@ async function processConversionJob(jobId: string) {
 
       child.stderr.on("data", (chunk) => {
       const line = chunk.toString();
-      stderrData += line;
+      stderrData = (stderrData + line).slice(-32_000);
 
       const timeMatch = line.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
       const speedMatch = line.match(/speed=\s*([0-9.]+x)/);
@@ -1364,11 +1381,15 @@ async function processConversionJob(jobId: string) {
           job.speed = "0x";
           job.eta = "00:00";
           job.outputFileSize = formatBytes(stats.size);
+          job.outputBytes = stats.size;
           broadcastConvertUpdate(jobId, true);
           log.info("CONVERT", `Conversion job ${jobId} completed successfully! Size: ${job.outputFileSize}`);
         } else {
           job.status = "failed";
-          job.error = `FFmpeg conversion failed (code ${code}). ${stderrData.slice(-120)}`;
+          job.error = /matches no streams|does not contain any stream/i.test(stderrData)
+            ? 'This source does not contain a decodable audio track.'
+            : job.studioPurpose ? 'Audio processing failed. Check that the source has a supported audio track and try again.'
+            : `FFmpeg conversion failed (code ${code}). ${stderrData.slice(-120)}`;
           broadcastConvertUpdate(jobId, true);
           log.error("CONVERT", `Conversion job ${jobId} failed with code ${code}`);
         }
@@ -1475,6 +1496,41 @@ function makeDownloadFileName(job: DownloadJob, extension: string): string {
 }
 
 const jobQueue = new Map<string, DownloadJob>();
+
+function resolveAudioStudioSource(value: unknown): { path: string; originalName: string; size: number; uploadId: string } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Choose an audio source first.');
+  const { kind, id } = value as { kind?: unknown; id?: unknown };
+  if (typeof id !== 'string' || !['download', 'conversion', 'upload'].includes(String(kind))) throw new Error('Invalid audio source reference.');
+  let source: { path: string; originalName: string; size: number; uploadId: string } | undefined;
+  let root: string;
+  if (kind === 'upload') {
+    if (!isValidUploadId(id)) throw new Error('Invalid upload ID.');
+    const upload = uploadedFiles.get(id);
+    if (upload) source = { ...upload, uploadId: id };
+    root = UPLOADS_DIR;
+  } else if (kind === 'download') {
+    if (!isValidJobId(id)) throw new Error('Invalid download ID.');
+    const job = jobQueue.get(id);
+    if (job?.status === 'completed' && job.filePath) {
+      source = { path: job.filePath, originalName: job.outputFileName || `${job.title}${path.extname(job.filePath)}`, size: 0, uploadId: '' };
+    }
+    root = DOWNLOADS_DIR;
+  } else {
+    if (!isValidJobId(id)) throw new Error('Invalid conversion ID.');
+    const job = conversionJobs.get(id);
+    if (job?.status === 'completed' && job.outputPath) {
+      source = { path: job.outputPath, originalName: job.outputFileName || `audio.${job.targetFormat}`, size: 0, uploadId: '' };
+    }
+    root = CONVERTED_DIR;
+  }
+  if (!source || !fs.existsSync(source.path)) throw new Error('The source is unavailable or has expired. Upload it again or download it again.');
+  const resolved = path.resolve(source.path);
+  if (!resolved.startsWith(`${path.resolve(root)}${path.sep}`)) throw new Error('Invalid source file.');
+  const stat = fs.statSync(resolved);
+  if (!stat.isFile() || stat.size === 0) throw new Error('The source file is empty or unavailable.');
+  return { ...source, path: resolved, originalName: path.basename(source.originalName), size: stat.size };
+}
+
 const wsSubscriptions = new Map<string, Set<WebSocket>>();
 const activeChildProcesses = new Map<string, any>();
 const activeDownloadRequests = new Map<string, any>();
@@ -2560,6 +2616,53 @@ async function startServer() {
     });
   });
 
+  // Studio jobs use trusted server file references and the existing bounded conversion queue.
+  app.post(['/api/audio/prepare', '/api/audio/cleanup-preview', '/api/audio/enhance'], (req, res) => {
+    try {
+      const isPreview = req.path !== '/api/audio/enhance';
+      const isCleanupPreview = req.path === '/api/audio/cleanup-preview';
+      const { source, jobId: requestedJobId, settings, format, quality } = req.body || {};
+      const jobId = requestedJobId || crypto.randomUUID();
+      if (!isValidJobId(jobId)) return res.status(400).json({ error: 'Invalid audio job ID.' });
+      if (conversionJobs.has(jobId)) return res.status(409).json({ error: 'This audio job already exists.' });
+      const waitingStudioJobs = Array.from(conversionJobs.values()).filter((job) => job.studioPurpose && ['queued', 'converting'].includes(job.status));
+      if (waitingStudioJobs.length >= 20) return res.status(429).json({ error: 'The audio queue is full. Wait for a job to finish and retry.' });
+      const options = isPreview ? { format: 'wav' as const, quality: '16bit' } : validateAudioExport(format, quality);
+      const enhancementSettings = isPreview && !isCleanupPreview ? undefined : validateAudioEnhancement(settings);
+      const fileInfo = resolveAudioStudioSource(source);
+      const job: ConversionJob = {
+        jobId, uploadId: '', inputPath: fileInfo.path,
+        originalName: fileInfo.originalName, originalSize: fileInfo.size,
+        targetFormat: options.format, exportQuality: options.quality,
+        studioPurpose: isCleanupPreview ? 'cleanup-preview' : isPreview ? 'preview' : 'enhancement', enhancementSettings,
+        status: 'queued', progress: 0, createdAt: Date.now(), eta: 'Waiting in queue',
+      };
+      conversionJobs.set(jobId, job);
+      enqueueConversionJob(jobId);
+      res.status(202).json({ jobId, status: job.status });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : 'Could not start audio processing.' });
+    }
+  });
+
+  app.get('/api/audio/preview/:jobId', (req, res) => {
+    const { jobId } = req.params;
+    if (!isValidJobId(jobId)) return res.status(400).json({ error: 'Invalid audio job ID.' });
+    const job = conversionJobs.get(jobId);
+    if (!job || !['preview', 'cleanup-preview'].includes(job.studioPurpose || '') || job.status !== 'completed' || !job.outputPath || !fs.existsSync(job.outputPath)) {
+      return res.status(404).json({ error: 'Audio preview is unavailable. Prepare the source again.' });
+    }
+    res.type('audio/wav');
+    res.setHeader('Cache-Control', 'no-store');
+    const touchedAt = new Date();
+    try {
+      fs.utimesSync(job.outputPath, touchedAt, touchedAt);
+      if (fs.existsSync(job.inputPath)) fs.utimesSync(job.inputPath, touchedAt, touchedAt);
+    } catch {}
+    // sendFile supports byte ranges so large audio can be scrubbed without loading it all into memory.
+    res.sendFile(job.outputPath);
+  });
+
   // Start conversion for batch or single items
   app.post("/api/convert/process", (req, res) => {
     try {
@@ -2752,8 +2855,7 @@ async function startServer() {
       opus: "audio/opus",
     };
 
-    const cleanOutName = (job.outputFileName || `${jobId}.${ext}`).replace(/[^a-zA-Z0-9_.-]/g, '_');
-    res.header("Content-Disposition", `attachment; filename="${cleanOutName}"`);
+    res.attachment(job.outputFileName || `${jobId}.${ext}`);
     res.header("Content-Type", mimeTypes[ext] || "application/octet-stream");
     res.header("X-Content-Type-Options", "nosniff");
 
@@ -3275,6 +3377,10 @@ setInterval(() => {
   try {
     const now = Date.now();
     const expiryMs = 15 * 60 * 1000; // 15 minutes
+    const activeConversions = Array.from(conversionJobs.values()).filter(
+      (job) => job.status === 'queued' || job.status === 'converting'
+    );
+    const activeInputPaths = new Set(activeConversions.map((job) => path.resolve(job.inputPath)));
 
     // Clean downloads directory
     if (fs.existsSync(DOWNLOADS_DIR)) {
@@ -3282,6 +3388,9 @@ setInterval(() => {
       files.forEach((file) => {
         const filePath = path.join(DOWNLOADS_DIR, file);
         const stats = fs.statSync(filePath);
+        if (activeInputPaths.has(path.resolve(filePath))) return;
+        const fileJobId = path.basename(file, path.extname(file));
+        if (jobQueue.get(fileJobId)?.status === 'downloading' || jobQueue.get(fileJobId)?.status === 'queued') return;
         if (now - stats.mtimeMs > expiryMs) {
           fs.unlinkSync(filePath);
           const jobId = path.basename(file, path.extname(file));
@@ -3291,9 +3400,6 @@ setInterval(() => {
     }
 
     // Clean uploads and converted directories
-    const activeConversions = Array.from(conversionJobs.values()).filter(
-      (job) => job.status === 'queued' || job.status === 'converting'
-    );
     const activeConversionIds = new Set(activeConversions.map((job) => job.jobId));
     const activeUploadIds = new Set(activeConversions.map((job) => job.uploadId));
     [UPLOADS_DIR, CONVERTED_DIR].forEach((targetDir) => {
@@ -3303,6 +3409,7 @@ setInterval(() => {
         const filePath = path.join(targetDir, file);
         const stats = fs.statSync(filePath);
         if (!stats.isFile() || now - stats.mtimeMs <= expiryMs) return;
+        if (activeInputPaths.has(path.resolve(filePath))) return;
 
         const fileId = file.split("_")[0];
         if (targetDir === UPLOADS_DIR && activeUploadIds.has(fileId)) return;

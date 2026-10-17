@@ -1,6 +1,8 @@
 import React, { lazy, Suspense, useEffect, useState, useCallback, useRef } from 'react';
 import { useAppStore } from './store/useAppStore';
 import BatchDownloadModal from './components/BatchDownloadModal';
+import FooterGroup from './components/FooterGroup';
+import { useScrollNavigation } from './lib/useScrollNavigation';
 import { motion, AnimatePresence, useScroll, useTransform, useReducedMotion } from 'motion/react';
 import { 
   Link2, Sparkles, Loader2, Info, DownloadCloud, History, 
@@ -17,6 +19,7 @@ const DownloadProgress = lazy(() => import('./components/DownloadProgress'));
 const HistoryPanel = lazy(() => import('./components/HistoryPanel'));
 const SettingsPanel = lazy(() => import('./components/SettingsPanel'));
 const ConverterPanel = lazy(() => import('./components/ConverterPanel'));
+const AudioEnhancerStudio = lazy(() => import('./components/AudioEnhancerStudio'));
 const AboutModal = lazy(() => import('./components/AboutModal'));
 const PwaInstallModal = lazy(() => import('./components/PwaInstallModal'));
 
@@ -58,6 +61,7 @@ export default function App() {
     activeJobs,
     activeTab, setActiveTab,
     conversionQueue,
+    audioStudioSource, setAudioStudioSource,
     pwaInstallPrompt, setPwaInstallPrompt,
     isPwaInstalled, setIsPwaInstalled, triggerInstall,
     preferences, startRealtimeDownload
@@ -83,6 +87,8 @@ export default function App() {
   const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const activeJobsCount = Object.keys(activeJobs).length;
+  const navigationHidden = useScrollNavigation(`${activeTab}:${isAnalyzing}`);
+  useEffect(() => { window.scrollTo({ top: 0, behavior: 'auto' }); }, [activeTab]);
 
   // ─── SCROLL EXPERIENCE HOOKS (60fps GPU Hardware Acceleration) ─────────────
   const shouldReduceMotion = useReducedMotion();
@@ -620,9 +626,10 @@ export default function App() {
       )}
 
       {/* ─── DESKTOP & TABLET HEADER BAR ─────────────────────────────────────── */}
-      <motion.header 
+      <motion.header
+        data-scroll-hidden={navigationHidden}
         style={{ backgroundColor: headerBg, borderColor: headerBorder }}
-        className="sticky top-0 p-3 sm:p-4 md:px-8 lg:px-10 flex justify-between items-center z-40 w-full backdrop-blur-xl border-b transition-colors"
+        className="app-header sticky top-0 p-3 sm:p-4 md:px-8 lg:px-10 flex justify-between items-center z-40 w-full backdrop-blur-xl border-b"
       >
         <div className="w-full max-w-7xl mx-auto flex justify-between items-center gap-2 sm:gap-4">
           {/* Logo */}
@@ -639,7 +646,7 @@ export default function App() {
           </button>
 
           {/* Navigation Tabs Pill (Desktop & Tablet) */}
-          <nav className="hidden md:flex items-center bg-black/60 border border-white/10 rounded-[10px] p-1 gap-0.5">
+          <nav aria-label="Main navigation" className="hidden lg:flex items-center bg-black/60 border border-white/10 rounded-[10px] p-1 gap-0.5">
             <button
               onClick={() => setActiveTab('downloader')}
               className={cn(
@@ -754,7 +761,7 @@ export default function App() {
       </motion.header>
 
       {/* ─── MAIN CONTENT ────────────────────────────────────────────────────── */}
-      <main className="flex-1 flex flex-col items-center justify-start px-4 w-full min-w-0 z-10 pb-28 md:pb-20 pt-4 max-w-7xl mx-auto">
+      <main className="flex-1 flex flex-col items-center justify-start px-4 w-full min-w-0 z-10 pb-12 lg:pb-20 pt-4 max-w-7xl mx-auto">
         {activeTab === 'converter' && (
           <div className="w-full">
             <Suspense fallback={<PanelLoading />}><ConverterPanel /></Suspense>
@@ -1061,7 +1068,7 @@ export default function App() {
       </main>
 
       {/* ─── NATIVE MOBILE BOTTOM NAVIGATION BAR (Phones) ──────────────────────── */}
-      <div className="md:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#080808]/95 backdrop-blur-lg border-t border-white/10 px-1 py-1.5 flex items-center justify-around shadow-2xl safe-area-pb">
+      <nav aria-label="Mobile and tablet navigation" data-scroll-hidden={navigationHidden} className="app-bottom-nav lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#080808]/95 backdrop-blur-lg border-t border-white/10 px-1 py-1.5 flex items-center justify-around shadow-2xl safe-area-pb">
         <button
           onClick={() => setActiveTab('downloader')}
           className={cn(
@@ -1130,7 +1137,7 @@ export default function App() {
           <SettingsIcon className="size-5" />
           <span className="text-[10px] tracking-wider uppercase font-semibold">Settings</span>
         </button>
-      </div>
+      </nav>
 
       {/* ─── SCROLL EXPERIENCE: FLOATING SCROLL TO TOP BUTTON ───────────────── */}
       <AnimatePresence>
@@ -1140,7 +1147,7 @@ export default function App() {
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.8 }}
             onClick={scrollToTop}
-            className="fixed bottom-20 md:bottom-8 right-6 z-40 p-2.5 rounded-full bg-black/80 hover:bg-black border border-white/15 text-white shadow-2xl backdrop-blur-xl transition-all cursor-pointer hover:border-[var(--accent)]"
+            className="fixed bottom-[calc(5rem+env(safe-area-inset-bottom))] lg:bottom-8 right-4 z-40 p-2.5 rounded-full bg-black/80 hover:bg-black border border-white/15 text-white shadow-2xl backdrop-blur-xl transition-colors cursor-pointer hover:border-[var(--accent)]"
             title="Scroll to top"
             aria-label="Scroll to top"
           >
@@ -1150,38 +1157,40 @@ export default function App() {
       </AnimatePresence>
 
       {/* ─── RESPONSIVE FOOTER ───────────────────────────────────────────────── */}
-      <footer className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-10 pt-4 pb-[calc(6rem+env(safe-area-inset-bottom))] md:pb-6 z-10" aria-label="Site footer">
-        <div className="rounded-2xl border border-white/10 bg-white/[0.025] px-4 py-5 sm:px-6 sm:py-6">
-          <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1.7fr)_minmax(15rem,1fr)] gap-6 lg:gap-10">
-            <section aria-labelledby="footer-platforms-heading">
-              <h2 id="footer-platforms-heading" className="text-[10px] uppercase font-bold text-gray-500 mb-3 tracking-[0.18em]">Supported platforms</h2>
-              <div className="flex flex-wrap gap-2">
+      <footer className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-10 pt-4 pb-[calc(6rem+env(safe-area-inset-bottom))] lg:pb-6 z-10" aria-label="Site footer">
+        <div className="rounded-2xl border border-white/10 bg-white/[0.025] px-4 py-2 sm:px-6 sm:py-6">
+          <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1.7fr)_minmax(15rem,1fr)] gap-2 sm:gap-6 lg:gap-10">
+            <FooterGroup title="Supported platforms" detail="10 platforms · video & audio">
+              <div className="grid grid-cols-2 sm:flex sm:flex-wrap gap-2">
                 {SUPPORTED_PLATFORMS.map((platform) => (
                   <a
                     key={platform.name}
                     href={platform.href}
                     target="_blank"
                     rel="noreferrer"
-                    className="rounded-full border border-white/10 bg-black/30 px-2.5 py-1.5 text-[11px] sm:text-xs font-semibold text-neutral-400 transition-colors hover:border-[var(--accent)]/40 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+                    className="flex items-center min-h-11 sm:min-h-9 rounded-lg sm:rounded-full border border-white/10 bg-black/30 px-2.5 py-2 text-[11px] sm:text-xs font-semibold text-neutral-400 transition-colors hover:border-[var(--accent)]/40 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
                   >
                     {platform.name}
                   </a>
                 ))}
               </div>
-            </section>
+            </FooterGroup>
 
-            <section className="flex flex-col justify-between gap-4 border-t border-white/10 pt-4 lg:border-t-0 lg:border-l lg:pt-0 lg:pl-6" aria-labelledby="footer-tools-heading">
-              <div>
-                <h2 id="footer-tools-heading" className="text-[10px] uppercase font-bold text-gray-500 mb-2 tracking-[0.18em]">Media tools</h2>
-                <p className="text-xs leading-relaxed text-neutral-300">yt-dlp extraction <span className="text-neutral-600">·</span> FFmpeg conversion</p>
-                <p className="mt-1 text-[11px] leading-relaxed text-neutral-500">Single links, playlists, batch queues, and audio/video file conversion.</p>
-              </div>
-              <div className="flex flex-col gap-1 text-[10px] text-neutral-500 sm:flex-row sm:items-center sm:justify-between lg:flex-col lg:items-start">
-                <span>Use content you own or have permission to save.</span>
-                <span>&copy; {new Date().getFullYear()} Pullio</span>
-              </div>
-            </section>
+            <div className="border-t border-white/10 pt-2 sm:pt-4 lg:border-t-0 lg:border-l lg:pt-0 lg:pl-6">
+              <FooterGroup title="Media tools" detail="Download, convert & enhance">
+                <div className="grid grid-cols-2 gap-2">
+                  {[
+                    { label: 'Video & audio', action: () => { setActiveTab('downloader'); scrollToTop(); } },
+                    { label: 'Batch downloads', action: () => { setBatchModalUrls([]); setIsBatchModalOpen(true); } },
+                    { label: 'File converter', action: () => { setActiveTab('converter'); scrollToTop(); } },
+                    { label: 'Audio studio', action: () => { setActiveTab('converter'); scrollToTop(); showToast('Add a file, then choose Enhance audio to open the studio.'); } },
+                  ].map((tool) => <button key={tool.label} type="button" onClick={tool.action} className="min-h-11 rounded-lg border border-white/10 px-3 py-2 text-left text-xs text-neutral-300 hover:bg-white/5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)]">{tool.label}</button>)}
+                </div>
+                <p className="mt-3 text-[11px] leading-relaxed text-neutral-500">Powered by yt-dlp &amp; FFmpeg.</p>
+              </FooterGroup>
+            </div>
           </div>
+          <div className="mt-3 sm:mt-5 border-t border-white/10 pt-3 pb-2 sm:pb-0 flex flex-col sm:flex-row gap-1 sm:justify-between text-[10px] leading-relaxed text-neutral-500"><span>Use content you own or have permission to save.</span><span>&copy; {new Date().getFullYear()} Pullio</span></div>
         </div>
       </footer>
 
@@ -1195,7 +1204,7 @@ export default function App() {
             role="status"
             aria-live="polite"
             aria-atomic="true"
-            className="fixed bottom-20 md:bottom-8 right-1/2 translate-x-1/2 md:translate-x-0 md:right-8 z-50 px-4 py-2.5 rounded-[10px] bg-black/90 border border-white/15 text-white text-xs font-bold shadow-2xl backdrop-blur-lg flex items-center gap-2 pointer-events-none max-w-[calc(100vw-2rem)]"
+            className="fixed bottom-[calc(5rem+env(safe-area-inset-bottom))] lg:bottom-8 right-1/2 translate-x-1/2 lg:translate-x-0 lg:right-8 z-50 px-4 py-2.5 rounded-[10px] bg-black/90 border border-white/15 text-white text-xs font-bold shadow-2xl backdrop-blur-lg flex items-center gap-2 pointer-events-none max-w-[calc(100vw-2rem)]"
           >
             <Sparkles className="size-3.5 text-[var(--accent)]" />
             <span>{toastMessage}</span>
@@ -1218,6 +1227,11 @@ export default function App() {
       )}
 
       {/* Customizable Multi-Video Batch Downloader Modal */}
+      {audioStudioSource && (
+        <Suspense fallback={<PanelLoading />}>
+          <AudioEnhancerStudio source={audioStudioSource} onClose={() => setAudioStudioSource(null)} />
+        </Suspense>
+      )}
       <BatchDownloadModal 
         isOpen={isBatchModalOpen} 
         onClose={() => setIsBatchModalOpen(false)} 

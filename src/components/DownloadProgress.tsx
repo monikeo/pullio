@@ -1,13 +1,13 @@
 import React, { useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import { motion, AnimatePresence } from 'motion/react';
-import { DownloadCloud, XCircle, AlertTriangle, CheckCircle2, RefreshCw, Download, ArrowLeft, Pause, Play, ChevronUp, ChevronDown } from 'lucide-react';
+import { DownloadCloud, XCircle, AlertTriangle, CheckCircle2, RefreshCw, Download, ArrowLeft, Pause, Play, ChevronUp, ChevronDown, AudioLines } from 'lucide-react';
 import { getMediaErrorGuidance } from '../lib/mediaErrors';
 
 type TransferFilter = 'all' | 'active' | 'paused' | 'failed' | 'completed';
 
 export default function DownloadProgress() {
-  const { activeJobs, cancelDownload, removeJob, clearCompletedJobs, setActiveTab, retryJob, pauseJob, resumeJob, reorderQueuedJob } = useAppStore();
+  const { activeJobs, cancelDownload, removeJob, clearCompletedJobs, setActiveTab, retryJob, pauseJob, resumeJob, reorderQueuedJob, setAudioStudioSource } = useAppStore();
   const [filter, setFilter] = useState<TransferFilter>('all');
   const [isRetryingFailed, setIsRetryingFailed] = useState(false);
   const [busyQueueAction, setBusyQueueAction] = useState<string | null>(null);
@@ -294,10 +294,13 @@ export default function DownloadProgress() {
 
                 {/* Direct Save Button when complete (Mobile iOS & Android essential fallback) */}
                 {isCompleted && (
-                  <div className="relative z-10 mt-3 pt-2 border-t border-white/5 flex items-center justify-between">
+                  <div className="relative z-10 mt-3 pt-2 border-t border-white/5 flex items-center justify-between gap-2 flex-wrap">
                     <span className="text-[10px] font-mono font-bold text-green-400 flex items-center gap-1">
                       <CheckCircle2 className="size-3.5" /> File Ready
                     </span>
+                    <button onClick={() => setAudioStudioSource({ kind: 'download', id: job.jobId, name: job.title || 'Downloaded audio' })} className="px-3 py-2 rounded-[6px] bg-white/5 hover:bg-white/10 border border-white/10 text-neutral-200 text-xs font-bold flex items-center gap-1.5 min-h-[36px]">
+                      <AudioLines className="size-3.5 text-[var(--accent)]" /> Enhance audio
+                    </button>
                     <a
                       href={`/api/files/${job.jobId}`}
                       download

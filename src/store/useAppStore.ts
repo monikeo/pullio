@@ -23,6 +23,8 @@ interface AppState {
   // Multi-tab navigation
   activeTab: 'downloader' | 'converter' | 'transfers' | 'history' | 'settings';
   setActiveTab: (tab: 'downloader' | 'converter' | 'transfers' | 'history' | 'settings') => void;
+  audioStudioSource: AudioStudioSource | null;
+  setAudioStudioSource: (source: AudioStudioSource | null) => void;
 
   // Converter Queue
   conversionQueue: ConversionItem[];
@@ -64,6 +66,7 @@ interface AppState {
 }
 
 import { sanitizeHistoryItem, sanitizeUserPreferences } from '../lib/security';
+import type { AudioStudioSource } from '../lib/audioEnhancement';
 
 const describeFormatSelector = (selector: string): string => {
   const stream = selector.match(/^yt:(video|merge|raw|audio-source):([A-Za-z0-9_.-]+)$/);
@@ -146,6 +149,8 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   activeTab: 'downloader',
   setActiveTab: (activeTab) => set({ activeTab }),
+  audioStudioSource: null,
+  setAudioStudioSource: (audioStudioSource) => set({ audioStudioSource }),
 
   conversionQueue: [],
   addConversionItems: (items) => {

@@ -739,7 +739,7 @@ export default function AnalyzePanel() {
                 {/* Quick presets keep the common choices visible and explicit. */}
                 <div className="p-2.5 bg-gradient-to-r from-[var(--accent)]/10 via-purple-500/10 to-indigo-500/10 border border-[var(--accent)]/25 rounded-[10px]">
                   <p className="text-[9px] text-gray-400 font-bold uppercase tracking-widest mb-2">Quick download presets</p>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <div className="grid grid-cols-1 gap-2">
                     <button
                       onClick={() => {
                         const itag = bestVideoFormat?.itag || 'best';
@@ -751,7 +751,7 @@ export default function AnalyzePanel() {
                       title="Download the highest video quality available"
                     >
                       <Zap className="size-4 fill-current shrink-0" />
-                      <span className="truncate">Best video · {bestVideoFormat ? conciseQuality(bestVideoFormat.quality) : 'best available'}</span>
+                      <span className="text-left leading-snug">Best video · {bestVideoFormat ? conciseQuality(bestVideoFormat.quality) : 'best available'}</span>
                     </button>
 
                     <button
@@ -765,7 +765,7 @@ export default function AnalyzePanel() {
                       title="Choose a compact video stream at 720p or the lowest available resolution"
                     >
                       <MonitorPlay className="size-4 text-[var(--accent)] shrink-0" />
-                      <span className="truncate">Smaller video · {smallerVideoFormat ? conciseQuality(smallerVideoFormat.quality) : 'unavailable'}</span>
+                      <span className="text-left leading-snug">Smaller video · {smallerVideoFormat ? conciseQuality(smallerVideoFormat.quality) : 'unavailable'}</span>
                     </button>
 
                     <button
@@ -779,7 +779,7 @@ export default function AnalyzePanel() {
                       title="Download audio only as MP3 when the encoder target is available"
                     >
                       <Music className="size-4 text-[var(--accent)] shrink-0" />
-                      <span className="truncate">Audio only · {bestAudioFormat?.quality || 'best available'}</span>
+                      <span className="text-left leading-snug">Audio only · {bestAudioFormat?.quality || 'best available'}</span>
                     </button>
                   </div>
                   <p className="text-[9px] text-gray-500 mt-2">Presets start the download immediately. Use the format list below to review options first.</p>

@@ -12,7 +12,8 @@
     "start": "node dist/server.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test:audio": "tsx --test tests/audio-enhancement.test.ts"
   },
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",

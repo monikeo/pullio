@@ -3,13 +3,13 @@ import { useAppStore } from '../store/useAppStore';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   History, Trash2, Download, ExternalLink, Copy, Check, Video, Music, 
-  Search, FileDown, ArrowRight, Play
+  Search, FileDown, ArrowRight, Play, AudioLines
 } from 'lucide-react';
 
 import { sanitizeUrl } from '../lib/security';
 
 export default function HistoryPanel() {
-  const { downloadHistory, deleteHistoryItem, clearHistory, setUrl, analyzeUrl, setActiveTab } = useAppStore() as any;
+  const { downloadHistory, deleteHistoryItem, clearHistory, setUrl, analyzeUrl, setActiveTab, setAudioStudioSource } = useAppStore() as any;
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
 
@@ -173,6 +173,7 @@ export default function HistoryPanel() {
 
                   {/* Actions */}
                   <div className="flex items-center gap-1.5 shrink-0 self-end sm:self-center">
+                    <button onClick={() => setAudioStudioSource({ kind: 'download', id: item.jobId, name: item.title })} className="p-2 min-h-[36px] min-w-[36px] rounded-[8px] bg-white/5 hover:bg-white/15 text-neutral-300 border border-white/10" title="Enhance this download's audio" aria-label={`Enhance audio for ${item.title}`}><AudioLines className="size-3.5" /></button>
                     <a
                       href={sanitizeUrl(item.downloadUrl)}
                       download
