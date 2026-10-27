@@ -1,3 +1,5 @@
+import { AudioEditSettings, resolveAudioEdit } from './audioEditing';
+
 export interface AudioEnhancementSettings {
   speed: number;
   keepPitch: boolean;
@@ -162,10 +164,14 @@ export function buildAudioCleanupFilters(settings: AudioEnhancementSettings): st
   return filters;
 }
 
-export function buildAudioEnhancementFilters(settings: AudioEnhancementSettings): string[] {
+export function buildAudioEnhancementFilters(settings: AudioEnhancementSettings, edit?: AudioEditSettings, sourceDuration?: number): string[] {
   const s = validateAudioEnhancement(settings);
   const m = getAudioMacros(s);
   const filters = buildAudioCleanupFilters(s);
+  const selection = edit ? resolveAudioEdit(edit, sourceDuration!, s.speed) : null;
+  if (selection && (selection.trimStart > 0 || selection.trimEnd !== sourceDuration)) {
+    filters.push(`atrim=start=${selection.trimStart}:end=${selection.trimEnd}`, 'asetpts=PTS-STARTPTS');
+  }
   if (s.speed !== 1) {
     if (s.keepPitch) filters.push(`atempo=${s.speed}`);
     else filters.push('aresample=48000', `asetrate=${Math.round(48000 * s.speed)}`, 'aresample=48000');
@@ -178,6 +184,8 @@ export function buildAudioEnhancementFilters(settings: AudioEnhancementSettings)
     filters.push(`acompressor=threshold=${Math.pow(10, m.compressorThresholdDb / 20).toFixed(6)}:ratio=${m.compressorRatio}:attack=10:release=200:makeup=1`);
   }
   if (m.active) filters.push('alimiter=limit=0.95:level=false:latency=true');
+  if (selection?.fadeIn) filters.push(`afade=t=in:st=0:d=${selection.fadeIn}`);
+  if (selection?.fadeOut) filters.push(`afade=t=out:st=${Math.max(0, selection.duration - selection.fadeOut)}:d=${selection.fadeOut}`);
   return filters;
 }
 

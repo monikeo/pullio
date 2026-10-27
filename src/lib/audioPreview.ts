@@ -18,6 +18,7 @@ export class AudioPreviewGraph {
   private filters: BiquadFilterNode[];
   private compressor: DynamicsCompressorNode;
   private guard: DynamicsCompressorNode;
+  private envelope: GainNode;
 
   constructor(private audio: HTMLAudioElement) {
     const Context = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -28,6 +29,7 @@ export class AudioPreviewGraph {
     this.wet = this.context.createGain();
     this.headroom = this.context.createGain();
     this.analyser = this.context.createAnalyser();
+    this.envelope = this.context.createGain();
     this.analyser.fftSize = 512;
     this.filters = ['highpass', 'lowpass', 'peaking', 'lowshelf', 'peaking', 'highshelf'].map((type) => {
       const filter = this.context.createBiquadFilter();
@@ -49,10 +51,11 @@ export class AudioPreviewGraph {
     this.guard.ratio.value = 20;
     this.guard.attack.value = 0.003;
     this.guard.release.value = 0.05;
-    this.source.connect(this.dry).connect(this.analyser);
+    this.source.connect(this.dry).connect(this.envelope);
     let last: AudioNode = this.source.connect(this.headroom);
     for (const filter of this.filters) last = last.connect(filter);
-    last.connect(this.compressor).connect(this.guard).connect(this.wet).connect(this.analyser);
+    last.connect(this.compressor).connect(this.guard).connect(this.wet).connect(this.envelope);
+    this.envelope.connect(this.analyser);
     this.analyser.connect(this.context.destination);
     this.wet.gain.value = 0;
   }
@@ -84,6 +87,13 @@ export class AudioPreviewGraph {
   }
 
   async resume() { await this.context.resume(); }
+
+  applyFade(gain: number, immediate = false) {
+    const now = this.context.currentTime;
+    this.envelope.gain.cancelScheduledValues(now);
+    if (immediate) this.envelope.gain.setValueAtTime(gain, now);
+    else this.envelope.gain.setTargetAtTime(gain, now, 0.005);
+  }
 
   close() {
     this.audio.pause();

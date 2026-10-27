@@ -12,6 +12,8 @@ import { promisify } from "util";
 import ffmpegPath from "ffmpeg-static";
 import multer from "multer";
 import { AudioEnhancementSettings, AudioExportFormat, buildAudioEnhancementFilters, buildAudioCleanupFilters, getAudioEncoderArgs, validateAudioEnhancement, validateAudioExport } from "./src/lib/audioEnhancement";
+import { AudioEditSettings, resolveAudioEdit, validateAudioEdit } from './src/lib/audioEditing';
+import { readAudioWaveform } from './src/lib/audioWaveform.server';
 
 const execFileAsync = promisify(execFile);
 
@@ -1116,6 +1118,7 @@ export interface ConversionJob {
   audioBitrate?: string;
   studioPurpose?: 'preview' | 'cleanup-preview' | 'enhancement';
   enhancementSettings?: AudioEnhancementSettings;
+  audioEdit?: AudioEditSettings;
   exportQuality?: string;
   status: 'queued' | 'converting' | 'completed' | 'failed' | 'cancelled';
   progress: number;
@@ -1131,6 +1134,7 @@ export interface ConversionJob {
 }
 
 const conversionJobs = new Map<string, ConversionJob>();
+const studioWaveforms = new WeakMap<ConversionJob, ReturnType<typeof readAudioWaveform>>();
 const uploadedFiles = new Map<string, { path: string; originalName: string; size: number }>();
 const activeConversionProcesses = new Map<string, any>();
 const lastConvertBroadcastTime = new Map<string, number>();
@@ -1240,7 +1244,9 @@ async function processConversionJob(jobId: string) {
 
     const sourceDuration = await getMediaDuration(job.inputPath);
     if (conversionJobs.get(jobId) !== job) return;
-    const totalDuration = sourceDuration / (job.studioPurpose === 'enhancement' ? job.enhancementSettings?.speed || 1 : 1);
+    const totalDuration = job.studioPurpose === 'enhancement'
+      ? resolveAudioEdit(job.audioEdit || validateAudioEdit(undefined), sourceDuration, job.enhancementSettings?.speed || 1).duration
+      : sourceDuration;
     job.duration = totalDuration;
 
     const baseName = path.parse(job.originalName).name.normalize('NFKC').replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").slice(0, 100) || 'audio';
@@ -1259,7 +1265,7 @@ async function processConversionJob(jobId: string) {
       if (job.enhancementSettings) {
         const filters = job.studioPurpose === 'cleanup-preview'
           ? buildAudioCleanupFilters(job.enhancementSettings)
-          : buildAudioEnhancementFilters(job.enhancementSettings);
+          : buildAudioEnhancementFilters(job.enhancementSettings, job.audioEdit, sourceDuration);
         if (filters.length) args.push('-af', filters.join(','));
       }
       if (job.studioPurpose === 'preview' || job.studioPurpose === 'cleanup-preview') args.push('-c:a', 'pcm_s16le', '-ar', '48000', '-ac', '2');
@@ -2621,7 +2627,7 @@ async function startServer() {
     try {
       const isPreview = req.path !== '/api/audio/enhance';
       const isCleanupPreview = req.path === '/api/audio/cleanup-preview';
-      const { source, jobId: requestedJobId, settings, format, quality } = req.body || {};
+      const { source, jobId: requestedJobId, settings, format, quality, edit } = req.body || {};
       const jobId = requestedJobId || crypto.randomUUID();
       if (!isValidJobId(jobId)) return res.status(400).json({ error: 'Invalid audio job ID.' });
       if (conversionJobs.has(jobId)) return res.status(409).json({ error: 'This audio job already exists.' });
@@ -2629,12 +2635,13 @@ async function startServer() {
       if (waitingStudioJobs.length >= 20) return res.status(429).json({ error: 'The audio queue is full. Wait for a job to finish and retry.' });
       const options = isPreview ? { format: 'wav' as const, quality: '16bit' } : validateAudioExport(format, quality);
       const enhancementSettings = isPreview && !isCleanupPreview ? undefined : validateAudioEnhancement(settings);
+      const audioEdit = isPreview ? undefined : validateAudioEdit(edit);
       const fileInfo = resolveAudioStudioSource(source);
       const job: ConversionJob = {
         jobId, uploadId: '', inputPath: fileInfo.path,
         originalName: fileInfo.originalName, originalSize: fileInfo.size,
         targetFormat: options.format, exportQuality: options.quality,
-        studioPurpose: isCleanupPreview ? 'cleanup-preview' : isPreview ? 'preview' : 'enhancement', enhancementSettings,
+        studioPurpose: isCleanupPreview ? 'cleanup-preview' : isPreview ? 'preview' : 'enhancement', enhancementSettings, audioEdit,
         status: 'queued', progress: 0, createdAt: Date.now(), eta: 'Waiting in queue',
       };
       conversionJobs.set(jobId, job);
@@ -2642,6 +2649,27 @@ async function startServer() {
       res.status(202).json({ jobId, status: job.status });
     } catch (error) {
       res.status(400).json({ error: error instanceof Error ? error.message : 'Could not start audio processing.' });
+    }
+  });
+
+  app.get('/api/audio/waveform/:jobId', async (req, res) => {
+    const { jobId } = req.params;
+    if (!isValidJobId(jobId)) return res.status(400).json({ error: 'Invalid audio job ID.' });
+    const job = conversionJobs.get(jobId);
+    if (!job || job.studioPurpose !== 'preview' || job.status !== 'completed' || !job.outputPath) return res.status(404).json({ error: 'Prepare the source again to load its waveform.' });
+    res.setHeader('Cache-Control', 'no-store');
+    try {
+      let waveform = studioWaveforms.get(job);
+      if (!waveform) {
+        waveform = readAudioWaveform(job.outputPath);
+        studioWaveforms.set(job, waveform);
+      }
+      const data = await waveform;
+      if (conversionJobs.get(jobId) !== job) return res.status(404).json({ error: 'This preview has expired.' });
+      res.json(data);
+    } catch {
+      studioWaveforms.delete(job);
+      res.status(422).json({ error: 'Waveform unavailable. You can still trim using the time controls.' });
     }
   });
 

@@ -1,14 +1,17 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useReducedMotion } from 'motion/react';
-import { AudioLines, Download, Loader2, RotateCcw, X, AlertCircle, Check } from 'lucide-react';
+import { AudioLines, Download, Loader2, RotateCcw, X, AlertCircle, Check, Repeat2 } from 'lucide-react';
+import AudioTimelineEditor from './AudioTimelineEditor';
+import { AudioEditSettings, DEFAULT_AUDIO_EDIT, fitAudioEdit, fitAudioLoop, formatAudioTime } from '../lib/audioEditing';
+import { useAudioEditorPlayback } from '../lib/useAudioEditorPlayback';
 import { useAppStore } from '../store/useAppStore';
 import { validateMediaUpload } from '../lib/security';
 import { AudioPreviewGraph, setAudioPlaybackSettings } from '../lib/audioPreview';
 import { AUDIO_EXPORT_QUALITIES, DEFAULT_AUDIO_ENHANCEMENT, AudioEnhancementSettings, AudioExportFormat, AudioSourceReference, AudioStudioSource, getAudioCleanupSignature, hasAudioCleanup, getAudioToneSettings, validateAudioEnhancement } from '../lib/audioEnhancement';
 
 const PRESET_KEY = 'pullio.audio-studio.preset.v1';
-const studioSections = [{ id: 'cleanup', label: 'Clean up' }, { id: 'tone', label: 'Tone & level' }, { id: 'export', label: 'Export' }] as const;
+const studioSections = [{ id: 'cleanup', label: 'Clean up' }, { id: 'tone', label: 'Tone & level' }, { id: 'edit', label: 'Trim & fades' }, { id: 'export', label: 'Export' }] as const;
 function readSavedPreset(): AudioEnhancementSettings | null {
   try {
     const stored = localStorage.getItem(PRESET_KEY);
@@ -155,12 +158,44 @@ export default function AudioEnhancerStudio({ source, onClose }: { source: Audio
   const [section, setSection] = useState<(typeof studioSections)[number]['id']>('cleanup');
   const [savedPreset, setSavedPreset] = useState(readSavedPreset);
   const [presetMessage, setPresetMessage] = useState('');
+  const [sourceDuration, setSourceDuration] = useState(0);
+  const [edit, setEdit] = useState<AudioEditSettings>({ ...DEFAULT_AUDIO_EDIT });
+  const [loopEnabled, setLoopEnabled] = useState(false);
+  const [loop, setLoop] = useState({ start: 0, end: 10 });
+  const [waveform, setWaveform] = useState<number[]>([]);
+  const [waveformStatus, setWaveformStatus] = useState<'loading' | 'ready' | 'failed'>('loading');
+  const [waveformAttempt, setWaveformAttempt] = useState(0);
   const ready = preparation.phase === 'ready';
   const cleanupSignature = getAudioCleanupSignature(settings);
   const cleanupWanted = hasAudioCleanup(settings);
   const cleanupMatches = !cleanupWanted || appliedCleanup?.signature === cleanupSignature;
   const activePreviewUrl = bypass ? previewUrl : appliedCleanup?.url || previewUrl;
+  const timeline = useAudioEditorPlayback({ audio: audioRef, graph: graphRef, previewUrl, duration: sourceDuration, edit, loop, loopEnabled, bypass, speed: settings.speed });
+  const clipEnd = edit.trimEnd ?? sourceDuration;
+  const clipDuration = Math.max(0, clipEnd - edit.trimStart) / settings.speed;
+  const activeLoop = sourceDuration > 0 ? fitAudioLoop(loop, edit, sourceDuration) : loop;
+  const editedClip = edit.trimStart > 0 || (edit.trimEnd !== null && edit.trimEnd < sourceDuration) || edit.fadeIn > 0 || edit.fadeOut > 0;
+  useEffect(() => { setExportResult(null); setExportError(null); }, [settings, edit, format, quality]);
   useEffect(() => { contentRef.current?.scrollTo({ top: 0, behavior: 'auto' }); }, [section]);
+  useEffect(() => { setEdit({ ...DEFAULT_AUDIO_EDIT }); setLoopEnabled(false); setLoop({ start: 0, end: 10 }); }, [source]);
+  useEffect(() => {
+    if (sourceDuration > 0) setEdit((current) => {
+      const next = fitAudioEdit(current, sourceDuration, settings.speed);
+      return JSON.stringify(next) === JSON.stringify(current) ? current : next;
+    });
+  }, [sourceDuration, settings.speed]);
+
+  useEffect(() => {
+    if (!previewUrl) return;
+    const controller = new AbortController();
+    setWaveformStatus('loading'); setWaveform([]);
+    void fetch(previewUrl.replace('/preview/', '/waveform/'), { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]) }).then(async (response) => {
+      const data = await response.json();
+      if (!response.ok || !Array.isArray(data.peaks) || data.peaks.length < 1 || data.peaks.length > 400 || !data.peaks.every((peak: unknown) => typeof peak === 'number' && Number.isFinite(peak) && peak >= 0 && peak <= 1)) throw new Error('Invalid waveform data.');
+      if (!controller.signal.aborted) { setWaveform(data.peaks); setWaveformStatus('ready'); }
+    }).catch(() => { if (!controller.signal.aborted) setWaveformStatus('failed'); });
+    return () => controller.abort();
+  }, [previewUrl, waveformAttempt]);
 
   const rememberPlayback = () => {
     const audio = audioRef.current;
@@ -226,8 +261,9 @@ export default function AudioEnhancerStudio({ source, onClose }: { source: Audio
         sourceRef.current = reference;
         setPreparation({ phase: 'preparing', progress: 0 });
         const id = await startStudioJob('/api/audio/prepare', { jobId: previewJobId, source: reference }, controller.signal);
-        await waitForStudioJob(id, controller.signal, (job) => setPreparation({ phase: 'preparing', progress: job.progress }));
+        const prepared = await waitForStudioJob(id, controller.signal, (job) => setPreparation({ phase: 'preparing', progress: job.progress }));
         if (controller.signal.aborted) return;
+        setSourceDuration(Number.isFinite(prepared.duration) ? prepared.duration! : 0);
         setPreviewUrl(`/api/audio/preview/${encodeURIComponent(id)}`);
         setPreparation({ phase: 'ready', progress: 100 });
       } catch (error) {
@@ -353,6 +389,7 @@ export default function AudioEnhancerStudio({ source, onClose }: { source: Audio
     try {
       if (!graphRef.current) graphRef.current = new AudioPreviewGraph(audioRef.current);
       graphRef.current.apply(settings, bypass);
+      timeline.synchronize();
       await graphRef.current.resume();
       setPreviewError(null);
       setPlaying(true);
@@ -389,12 +426,14 @@ export default function AudioEnhancerStudio({ source, onClose }: { source: Audio
     const restore = playbackRestoreRef.current;
     playbackRestoreRef.current = null;
     if (audio) {
+      if (Number.isFinite(audio.duration) && audio.duration > 0) setSourceDuration(audio.duration);
       setAudioPlaybackSettings(audio, bypassRef.current ? 1 : settingsRef.current.speed, bypassRef.current || settingsRef.current.keepPitch);
       if (restore && Number.isFinite(audio.duration)) {
         audio.currentTime = Math.min(restore.time, Math.max(0, audio.duration - 0.01));
         if (restore.resume) void audio.play().catch(() => setPreviewError('Press Play to continue listening to the updated preview.'));
       }
     }
+    timeline.synchronize();
     clearRetiredCleanupJobs();
   };
 
@@ -409,7 +448,7 @@ export default function AudioEnhancerStudio({ source, onClose }: { source: Audio
     setExportResult(null);
     setExportProgress({ jobId, status: 'queued', progress: 0 });
     try {
-      await startStudioJob('/api/audio/enhance', { jobId, source: sourceRef.current, settings, format, quality }, controller.signal);
+      await startStudioJob('/api/audio/enhance', { jobId, source: sourceRef.current, settings, format, quality, edit }, controller.signal);
       const result = await waitForStudioJob(jobId, controller.signal, setExportProgress);
       if (controller.signal.aborted) return;
       setExportResult(result);
@@ -492,8 +531,12 @@ export default function AudioEnhancerStudio({ source, onClose }: { source: Audio
                   <span className="text-xs text-neutral-400">{bypass ? (playing ? 'Listening to original' : 'Original selected') : !cleanupMatches ? (appliedCleanup ? 'Previous cleanup · updating' : 'Original audio · cleanup pending') : (playing ? 'Listening with your settings' : 'Preview your settings')}</span>
                   <button type="button" aria-pressed={bypass} onClick={() => setComparison(!bypass)} className={`px-3 py-2 rounded-lg text-xs font-bold border ${bypass ? 'border-[var(--accent)] text-[var(--accent)]' : 'border-white/15 text-neutral-200'} focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)]`}>Compare original</button>
                 </div>
-                <canvas ref={canvasRef} width={960} height={70} aria-hidden="true" className="w-full h-7 sm:h-10" />
+                <canvas ref={canvasRef} width={960} height={70} aria-hidden="true" className="hidden sm:block w-full h-7" />
                 <audio key={previewUrl} ref={audioRef} src={activePreviewUrl!} controls controlsList="nodownload" preload="metadata" onLoadedMetadata={restorePlayback} onPlay={() => void startPreview()} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} onError={() => setPreviewError('The preview is unavailable or expired. Prepare it again to continue listening.')} className="w-full h-11 mt-2" aria-label="Audio preview player" />
+                <div className="flex items-center justify-between gap-2 mt-2 flex-wrap">
+                  <button type="button" aria-pressed={loopEnabled} disabled={!(sourceDuration > 0)} onClick={() => setLoopEnabled(!loopEnabled)} className={`inline-flex items-center gap-1.5 min-h-10 px-2.5 rounded-lg border text-xs ${loopEnabled ? 'text-[var(--accent)] border-[var(--accent)]/50' : 'text-neutral-400 border-white/10'}`}><Repeat2 className="size-3.5" />{loopEnabled ? 'Loop on' : 'Loop off'}</button>
+                  <button type="button" onClick={() => setSection('edit')} className="text-[11px] text-neutral-400 min-h-10 text-right font-mono">{loopEnabled ? `Loop ${formatAudioTime(activeLoop.start)}–${formatAudioTime(activeLoop.end)}` : `Clip ${formatAudioTime(clipDuration)}`} <span className="underline font-sans">Edit</span></button>
+                </div>
                 {cleanupWanted && (
                   <div className="mt-3 text-xs space-y-2" role={cleanupProgress.phase === 'failed' ? 'alert' : 'status'}>
                     {cleanupProgress.phase === 'waiting' || cleanupProgress.phase === 'processing' ? <>
@@ -508,7 +551,7 @@ export default function AudioEnhancerStudio({ source, onClose }: { source: Audio
             )}
           </section>
         </div>
-        <div role="tablist" aria-label="Audio studio sections" className="grid grid-cols-3 gap-1 border-b border-white/10 px-4 pt-3 sm:px-6 shrink-0">
+        <div role="tablist" aria-label="Audio studio sections" className="grid grid-cols-4 gap-0.5 border-b border-white/10 px-2 pt-2 sm:px-6 shrink-0">
           {studioSections.map((item, index) => <button key={item.id} type="button" role="tab" id={`studio-tab-${item.id}`} aria-controls={`studio-panel-${item.id}`} aria-selected={section === item.id} tabIndex={section === item.id ? 0 : -1} onClick={() => setSection(item.id)} onKeyDown={(event) => {
             const offset = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0;
             const next = event.key === 'Home' ? 0 : event.key === 'End' ? studioSections.length - 1 : (index + offset + studioSections.length) % studioSections.length;
@@ -516,7 +559,7 @@ export default function AudioEnhancerStudio({ source, onClose }: { source: Audio
               event.preventDefault(); setSection(studioSections[next].id);
               document.getElementById(`studio-tab-${studioSections[next].id}`)?.focus();
             }
-          }} className={`min-h-11 px-2 py-2.5 text-xs sm:text-sm font-semibold border-b-2 transition-colors ${section === item.id ? 'border-[var(--accent)] text-white' : 'border-transparent text-neutral-400 hover:text-white'}`}>{item.label}</button>)}
+          }} className={`min-h-11 min-w-0 px-1 py-2.5 text-[11px] sm:text-sm font-semibold border-b-2 transition-colors ${section === item.id ? 'border-[var(--accent)] text-white' : 'border-transparent text-neutral-400 hover:text-white'}`}>{item.label}</button>)}
         </div>
         <div ref={contentRef} className="audio-studio-content p-4 sm:px-6">
           <fieldset disabled={exporting} className="min-w-0 space-y-4 disabled:opacity-60">
@@ -526,9 +569,12 @@ export default function AudioEnhancerStudio({ source, onClose }: { source: Audio
                 <button type="button" onClick={savePreset} className="text-xs px-3 min-h-10 rounded-lg border border-white/15 text-neutral-200 hover:bg-white/5">Save my preset</button>
                 {savedPreset && <button type="button" onClick={() => { setSettings({ ...savedPreset }); setComparison(false); setPresetMessage('Your saved preset is applied.'); }} className="text-xs px-3 min-h-10 rounded-lg border border-white/15 text-neutral-200 hover:bg-white/5">Use my preset</button>}
               </div>
-              <button type="button" onClick={() => { setSettings({ ...DEFAULT_AUDIO_ENHANCEMENT }); setComparison(false); }} className="text-xs text-neutral-300 flex items-center gap-1.5 px-2 py-2 rounded-lg hover:bg-white/5"><RotateCcw className="size-3.5" /> Reset</button>
+              <button type="button" onClick={() => { setSettings({ ...DEFAULT_AUDIO_ENHANCEMENT }); setEdit({ ...DEFAULT_AUDIO_EDIT }); setLoopEnabled(false); setLoop({ start: 0, end: 10 }); setComparison(false); }} className="text-xs text-neutral-300 flex items-center gap-1.5 px-2 py-2 rounded-lg hover:bg-white/5"><RotateCcw className="size-3.5" /> Reset</button>
             </div>
             {presetMessage && <p role="status" className="text-xs text-neutral-400">{presetMessage}</p>}
+            <section role="tabpanel" id="studio-panel-edit" aria-labelledby="studio-tab-edit" hidden={section !== 'edit'}>
+              {ready && sourceDuration > 0 ? <AudioTimelineEditor duration={sourceDuration} currentTime={timeline.currentTime} peaks={waveform} waveformStatus={waveformStatus} edit={edit} speed={settings.speed} loop={loop} loopEnabled={loopEnabled} onEdit={(next) => { setEdit(next); setComparison(false); }} onLoop={setLoop} onLoopEnabled={setLoopEnabled} onSeek={timeline.seek} onRetryWaveform={() => setWaveformAttempt((attempt) => attempt + 1)} /> : <p role="status" className="text-xs text-neutral-400">Prepare your audio to choose a clip and add fades.</p>}
+            </section>
             <section role="tabpanel" id="studio-panel-cleanup" aria-labelledby="studio-tab-cleanup" hidden={section !== 'cleanup'} className="space-y-4">
             <p className="text-xs text-neutral-400 leading-relaxed">Cleanup updates automatically after you stop adjusting. Wait for “Cleanup preview ready” before comparing. Tone and speed controls stay live.</p>
             <div className="flex flex-wrap gap-2" aria-label="Audio cleanup presets">
@@ -561,6 +607,7 @@ export default function AudioEnhancerStudio({ source, onClose }: { source: Audio
             <p className="text-[11px] leading-relaxed text-neutral-400">Voice focus uses EQ rather than separating vocals from music. Clarity changes tone and dynamics; it cannot restore lost detail. Preview and export may sound slightly different.</p>
             </section>
             <section role="tabpanel" id="studio-panel-export" aria-labelledby="studio-tab-export" hidden={section !== 'export'} className="space-y-4">
+            {ready && <p className="text-xs text-neutral-300 leading-relaxed font-mono">Selected {formatAudioTime(edit.trimStart)} → {formatAudioTime(clipEnd)} · Export {formatAudioTime(clipDuration)}<br />Fade in {edit.fadeIn.toFixed(2)}s · Fade out {edit.fadeOut.toFixed(2)}s</p>}
             <p className="text-xs leading-relaxed text-neutral-400">Choose a format and quality, then export. You can keep listening while the file processes.</p>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div><label htmlFor="audio-export-format" className="block text-xs text-neutral-400 mb-2">Export format</label><select id="audio-export-format" value={format} onChange={(event) => { const next = event.target.value as AudioExportFormat; setFormat(next); setQuality(AUDIO_EXPORT_QUALITIES[next][0].value); }} className={controlClass}>{Object.keys(AUDIO_EXPORT_QUALITIES).map((item) => <option key={item} value={item}>{item === 'm4a' ? 'M4A (AAC)' : item.toUpperCase()}</option>)}</select></div>
@@ -572,6 +619,7 @@ export default function AudioEnhancerStudio({ source, onClose }: { source: Audio
           </fieldset>
         </div>
           <footer className="audio-studio-export shrink-0 border-t border-white/10 px-4 py-3 sm:px-6 space-y-2 bg-[var(--studio-surface)]">
+            {editedClip && <p className="text-[11px] text-neutral-400 font-mono">Clip {formatAudioTime(edit.trimStart)} → {formatAudioTime(clipEnd)} · {formatAudioTime(clipDuration)} export</p>}
             {exporting ? (
               <div role="status" className="space-y-3">
                 <div className="flex justify-between items-center gap-3 text-xs text-neutral-200"><span>{exportProgress?.status === 'queued' ? 'Waiting in conversion queue' : 'Exporting audio'} · {Math.round(exportProgress?.progress || 0)}%</span><button type="button" onClick={cancelExport} className="px-3 py-2 rounded-lg border border-white/20">Cancel export</button></div>

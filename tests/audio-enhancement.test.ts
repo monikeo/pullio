@@ -8,6 +8,51 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import ffmpeg from 'ffmpeg-static';
 import { AUDIO_EXPORT_QUALITIES, DEFAULT_AUDIO_ENHANCEMENT, buildAudioEnhancementFilters, buildAudioCleanupFilters, validateAudioEnhancement, validateAudioExport } from '../src/lib/audioEnhancement';
+import { DEFAULT_AUDIO_EDIT, fitAudioEdit, fitAudioLoop, getAudioFadeGain, resolveAudioEdit, validateAudioEdit } from '../src/lib/audioEditing';
+
+test('trim, fade and loop boundaries stay valid across speed and selection changes', () => {
+  for (const edit of [null, [], { ...DEFAULT_AUDIO_EDIT, trimStart: '1:movie=/secret' }, { ...DEFAULT_AUDIO_EDIT, trimStart: NaN }, { ...DEFAULT_AUDIO_EDIT, fadeIn: Infinity }, { ...DEFAULT_AUDIO_EDIT, trimStart: 2, trimEnd: 1 }]) assert.throws(() => validateAudioEdit(edit));
+  assert.deepEqual(validateAudioEdit(undefined), DEFAULT_AUDIO_EDIT);
+  assert.throws(() => resolveAudioEdit({ ...DEFAULT_AUDIO_EDIT, trimEnd: 12 }, 10, 1));
+  assert.throws(() => resolveAudioEdit({ ...DEFAULT_AUDIO_EDIT, fadeIn: 3, fadeOut: 3 }, 10, 2));
+  const fitted = fitAudioEdit({ trimStart: 1, trimEnd: 3, fadeIn: 2, fadeOut: 2 }, 10, 2);
+  assert.equal(fitted.fadeIn, 0.5); assert.equal(fitted.fadeOut, 0.5);
+  assert.deepEqual(fitAudioLoop({ start: 0, end: 20 }, fitted, 10), { start: 1, end: 3 });
+  const nearEnd = fitAudioLoop({ start: 9, end: 10 }, fitted, 10);
+  assert.ok(nearEnd.start >= 1 && nearEnd.start < nearEnd.end && nearEnd.end <= 3);
+  assert.deepEqual(nearEnd, { start: 2, end: 3 });
+  assert.deepEqual(fitAudioLoop({ start: 3, end: 4 }, { ...DEFAULT_AUDIO_EDIT, trimStart: 8, trimEnd: 12 }, 20), { start: 8, end: 9 });
+  assert.equal(getAudioFadeGain(1, fitted, 10, 2), 0);
+  assert.equal(getAudioFadeGain(1.5, fitted, 10, 2), 0.5);
+  assert.equal(getAudioFadeGain(2, fitted, 10, 2), 1);
+  assert.equal(getAudioFadeGain(3, fitted, 10, 2), 0);
+});
+
+test('export trims the correct source section and fades at the chosen playback speed', () => {
+  for (const keepPitch of [true, false]) {
+    const settings = { ...DEFAULT_AUDIO_ENHANCEMENT, speed: 2, keepPitch };
+    const edit = { trimStart: 4, trimEnd: 8, fadeIn: 0.5, fadeOut: 0.5 };
+    const filters = buildAudioEnhancementFilters(settings, edit, 9);
+    const bytes = execFileSync(ffmpeg!, ['-v', 'error', '-f', 'lavfi', '-i', 'aevalsrc=if(lt(t\\,3)\\,0.4*sin(2*PI*220*t)\\,0.4*sin(2*PI*880*t)):s=48000:d=9', '-af', filters.join(','), '-ar', '48000', '-f', 'f32le', '-'], { maxBuffer: 2 * 1024 * 1024 });
+    const samples = new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    assert.ok(Math.abs(samples.length / 48000 - 2) < 0.06);
+    const rms = (from: number, to: number) => {
+      let sum = 0;
+      for (let index = Math.floor(from * 48000); index < Math.floor(to * 48000); index++) sum += samples[index] ** 2;
+      return Math.sqrt(sum / Math.floor((to - from) * 48000));
+    };
+    const middle = rms(0.9, 1.1);
+    assert.ok(rms(0.01, 0.03) < middle * 0.1);
+    assert.ok(rms(1.97, 1.99) < middle * 0.1);
+    assert.ok(rms(0.24, 0.26) / middle > 0.47 && rms(0.24, 0.26) / middle < 0.53);
+    let sine = 0; let cosine = 0;
+    for (let index = 40000; index < 50000; index++) {
+      const phase = 2 * Math.PI * (keepPitch ? 880 : 1760) * index / 48000;
+      sine += samples[index] * Math.sin(phase); cosine += samples[index] * Math.cos(phase);
+    }
+    assert.ok(Math.hypot(sine, cosine) / 10000 > 0.1, 'Trim must keep the later high tone, with the requested pitch behavior');
+  }
+});
 
 test('untrusted settings and mismatched format qualities cannot enter the processor', () => {
   for (const value of [NaN, Infinity, 0, 2.1, '1;movie=secret']) {
@@ -215,7 +260,14 @@ test('studio API prepares seekable previews, exports every offered quality, and 
   const head = await fetch(`${base}/api/audio/preview/${previewId}`, { method: 'HEAD' });
   assert.equal(head.status, 200);
   assert.equal((await head.arrayBuffer()).byteLength, 0);
+  const waveform = await fetch(`${base}/api/audio/waveform/${previewId}`);
+  assert.equal(waveform.status, 200);
+  const waveformData = await waveform.json();
+  assert.equal(waveformData.peaks.length, 400);
+  assert.ok(waveformData.peaks.every((peak: number) => peak > 0 && peak <= 1));
+  assert.ok(Math.abs(waveformData.duration - 3) < 0.001);
   await fetch(`${base}/api/convert/${previewId}`, { method: 'DELETE' });
+  assert.equal((await fetch(`${base}/api/audio/waveform/${previewId}`)).status, 404);
 
   const cleanupSettings = { ...DEFAULT_AUDIO_ENHANCEMENT, speed: 1.25, noiseRemoval: true, humRemoval: true, noiseGate: true, clickRemoval: true, deEss: true, normalizeLoudness: true };
   const cleanupId = await start('/api/audio/cleanup-preview', { source, settings: cleanupSettings });
@@ -235,6 +287,16 @@ test('studio API prepares seekable previews, exports every offered quality, and 
     const bytes = execFileSync(ffmpeg!, ['-v', 'error', '-i', file, '-ar', '48000', '-ac', '2', '-f', 'f32le', '-'], { maxBuffer: 4 * 1024 * 1024 });
     return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
   };
+  const editedId = await start('/api/audio/enhance', { source, settings: { ...DEFAULT_AUDIO_ENHANCEMENT, speed: 1.25 }, edit: { trimStart: 0.5, trimEnd: 2.5, fadeIn: 0.25, fadeOut: 0.5 }, format: 'wav', quality: '24bit' });
+  const editedJob = await wait(editedId);
+  assert.equal(editedJob.status, 'completed', editedJob.error);
+  assert.equal(editedJob.duration, 1.6);
+  const editedFile = path.join(directory, 'edited.wav');
+  fs.writeFileSync(editedFile, Buffer.from(await (await fetch(`${base}/api/convert/download/${editedId}`)).arrayBuffer()));
+  assert.ok(Math.abs(decode(editedFile).length / (48000 * 2) - 1.6) < 0.05);
+  const invalidEdit = await start('/api/audio/enhance', { source, settings: DEFAULT_AUDIO_ENHANCEMENT, edit: { ...DEFAULT_AUDIO_EDIT, trimStart: 4 }, format: 'wav', quality: '24bit' });
+  assert.match((await wait(invalidEdit)).error, /trim selection/);
+  assert.equal((await json('/api/audio/enhance', { source, settings: DEFAULT_AUDIO_ENHANCEMENT, edit: { ...DEFAULT_AUDIO_EDIT, fadeOut: '1;movie=/secret' }, format: 'wav', quality: '24bit' })).status, 400);
   const previewSamples = decode(cleanedPath);
   const exportSamples = decode(exportedPath);
   assert.equal(previewSamples.length, exportSamples.length);
