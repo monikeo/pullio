@@ -39,6 +39,18 @@ A high-performance, self-hosted media extraction and transcoding platform built 
 
 ## System Requirements
 
+### Downloader reliability
+
+- Real media URLs always use the downloader. Words such as `demo` or parameters such as `track=` never select a sample file. Optional development demos require `PULLIO_ENABLE_DEMOS=1` and an exact `https://demo.pullio.invalid/video`, `/audio`, or `/playlist` URL. Production ignores this flag.
+- Transfers fail after **3 minutes without meaningful progress**, rather than after a fixed total duration. Byte progress, processing stages, and output file changes keep the worker alive. Merging/conversion gets at least 10 minutes of inactivity allowance. Configure the transfer threshold with `PULLIO_DOWNLOAD_STALL_MS` (1,000–1,800,000 ms).
+- The queue is saved atomically to `pullio-data/download-queue.json`; refresh reloads the server queue and reconnects progress updates. Restart recovers active downloads into the queue, keeps their order, and leaves paused jobs paused. Up to 500 jobs are retained. Clear finished transfers to make room.
+- **Pause** stops an active worker and its child processes while keeping partial downloads. **Resume** continues with yt-dlp's partial/fragment support and the same requested format. A source that does not support resuming may restart the transfer; interrupted merging/conversion may run again. Cancelling removes the job and its files.
+- Matching media, format, type, and output container reuse an existing queued, paused, active, or available completed job. Tracking variants of recognized platform URLs are normalized. Choose **Download another copy** when a separate job is intentional. Different media parts, qualities, and containers stay separate.
+- **Save all as ZIP** packages completed downloads. Select individual ready files to save a specific batch instead. ZIPs stream from server disk with unique filenames and ZIP64 support, avoiding whole-archive buffers in browser memory. Requests expire after 5 minutes; at most 4 ZIP streams run at once.
+- Transfer cards show reading details, video/audio download, merging, conversion, and file preparation. Stream percentages reset for each stream; processing stages use an indeterminate indicator until the file is ready.
+
+Downloaded files remain for **24 hours since their last access**; paused/queued/active files are protected from expiry. Uploads and converted outputs retain their existing 15-minute expiry. Set `PULLIO_STORAGE_DIR` to a persistent volume in hosted/container deployments. Recovery needs both the journal and media files; ephemeral storage cannot survive a new container. A corrupt journal is preserved separately and reported instead of silently pretending the old queue was recovered. Downloads created before this update have no saved queue to restore. Restart the server after upgrading.
+
 ### Audio studio notes
 
 The studio uses native Web Audio for live tone/speed preview and existing server FFmpeg for cleanup and export; no browser FFmpeg download is needed. Noise reduction uses adaptive wavelet profiling (`afwtdn`) plus rumble filtering. Hum removal targets the selected 50/60 Hz frequency and its first four harmonics. Quiet pauses uses a noise gate; click repair uses `adeclick`; sibilance control uses `deesser`. Higher strength can soften speech, and aggressive gating can cut quiet words.
@@ -208,8 +220,20 @@ GET /api/stream?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D...&itag=best&ty
 #### `GET /api/jobs/:jobId`
 Fetches current status, downloaded byte count, download speed, and completion download URL.
 
+#### `GET /api/jobs`
+Returns all recoverable download jobs, concurrency, and any persistence warning. Public job records include `stage`, optional `stageProgress`, and timestamps without internal file paths.
+
+#### `POST /api/jobs/:jobId/pause` / `POST /api/jobs/:jobId/resume`
+Pause an active or queued download, or resume a paused download with retained partial files. Paused jobs do not consume a worker slot.
+
+#### `POST /api/downloads/archive`
+Pass `{ "jobIds": ["completed-job-id", "another-completed-job-id"] }` (1–500 IDs). The response supplies a short-lived `downloadUrl` for a streamed ZIP. Entry names use the configured filename template and receive suffixes when names collide.
+
+#### `DELETE /api/jobs`
+Pass `{ "jobIds": ["finished-job-id"] }` to clear completed/failed jobs durably in one request. Active jobs are rejected.
+
 #### `POST /api/jobs/:jobId/retry`
-Re-queues a failed job with automatic adaptive fallback stream selection.
+Re-queues a failed job using the requested format and available partial files.
 
 #### `DELETE /api/jobs/:jobId`
 Cancels an active download, terminates child processes, and purges partial files from disk.

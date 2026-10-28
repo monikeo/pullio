@@ -19,6 +19,13 @@ interface AppState {
   setActiveJobId: (jobId: string | null) => void;
   activeJobs: Record<string, DownloadState>;
   wsInstance: WebSocket | null;
+  queueRecoveryError: string | null;
+  downloadNotice: string | null;
+  duplicateJobId: string | null;
+  recoverDownloads: () => Promise<void>;
+  acceptDownloadResponse: (data: any) => void;
+  downloadAnotherCopy: (jobId: string) => Promise<void>;
+  dismissDownloadNotice: () => void;
 
   // Multi-tab navigation
   activeTab: 'downloader' | 'converter' | 'transfers' | 'history' | 'settings';
@@ -52,13 +59,12 @@ interface AppState {
   setIsPwaInstalled: (installed: boolean) => void;
   triggerInstall: () => Promise<boolean>;
 
-  startRealtimeDownload: (jobId: string, title?: string, thumbnail?: string, type?: 'video' | 'audio', originalUrl?: string, provider?: ProviderType, queuePosition?: number) => void;
   ensureWebSocketConnected: () => WebSocket | null;
   subscribeConversionJobs: (jobIds: string[]) => void;
   retryJob: (jobId: string) => Promise<void>;
   cancelDownload: (jobId?: string) => void;
-  removeJob: (jobId: string) => void;
-  clearCompletedJobs: () => void;
+  removeJob: (jobId: string) => Promise<void>;
+  clearCompletedJobs: () => Promise<void>;
   pauseJob: (jobId: string) => Promise<void>;
   resumeJob: (jobId: string) => Promise<void>;
   reorderQueuedJob: (jobId: string, direction: 'up' | 'down') => Promise<void>;
@@ -67,6 +73,46 @@ interface AppState {
 
 import { sanitizeHistoryItem, sanitizeUserPreferences } from '../lib/security';
 import type { AudioStudioSource } from '../lib/audioEnhancement';
+import { DOWNLOAD_STAGE_LABELS, DownloadStage } from '../lib/downloads';
+
+let recoveryRequest: Promise<void> | null = null;
+const dismissedDownloadIds = new Set<string>();
+const autoSavedDownloadIds = new Set<string>();
+
+function rememberCompletedDownload(job: DownloadState, autoSave = false) {
+  const store = useAppStore.getState();
+  if (!store.downloadHistory.some(item => item.jobId === job.jobId)) store.addToHistory({
+    id: job.jobId, jobId: job.jobId, url: job.url || '', title: job.title || 'Downloaded media', thumbnail: job.thumbnail || '',
+    provider: job.provider || 'generic', format: job.format || 'Best', type: job.type || 'video', fileSize: job.fileSize || 'Complete',
+    timestamp: job.updatedAt || Date.now(), downloadUrl: `/api/files/${job.jobId}`,
+  });
+  if (autoSave && !autoSavedDownloadIds.has(job.jobId) && Object.keys(store.activeJobs).length <= 1) {
+    autoSavedDownloadIds.add(job.jobId);
+    const link = document.createElement('a'); link.href = `/api/files/${job.jobId}`; link.download = ''; document.body.appendChild(link); link.click(); link.remove();
+  }
+}
+
+function savedActiveTab(): AppState['activeTab'] {
+  try { const tab = localStorage.getItem('pullio_active_tab'); if (['downloader', 'converter', 'transfers', 'history', 'settings'].includes(tab || '')) return tab as AppState['activeTab']; } catch {}
+  return 'downloader';
+}
+
+function stateFromServer(raw: any): DownloadState | null {
+  if (!raw || typeof raw.jobId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(raw.jobId) || !['queued', 'paused', 'downloading', 'completed', 'failed'].includes(raw.status)) return null;
+  const formatSelector = String(raw.itag || raw.formatSelector || 'best');
+  return {
+    jobId: raw.jobId, status: raw.status, isDownloading: raw.status === 'queued' || raw.status === 'downloading',
+    stage: Object.hasOwn(DOWNLOAD_STAGE_LABELS, raw.stage) ? raw.stage as DownloadStage : raw.status === 'downloading' ? 'downloading' : raw.status,
+    stageProgress: typeof raw.stageProgress === 'number' && Number.isFinite(raw.stageProgress) ? Math.max(0, Math.min(100, raw.stageProgress)) : undefined,
+    progress: typeof raw.progress === 'number' ? Math.max(0, Math.min(100, raw.progress)) : 0,
+    speed: raw.speed || '', eta: raw.eta || '--:--', title: raw.title || 'Media Download', thumbnail: raw.thumbnail || '',
+    url: raw.url || '', provider: raw.provider || 'generic', type: raw.type === 'audio' ? 'audio' : 'video',
+    fileSize: raw.fileSize || 'Unknown', bytesDownloaded: raw.bytesDownloaded || '0 MB', formatSelector, format: describeFormatSelector(formatSelector),
+    queuePosition: Number.isInteger(raw.queuePosition) ? raw.queuePosition : undefined, error: raw.error,
+    createdAt: raw.createdAt, updatedAt: raw.updatedAt, recoveryMessage: raw.recoveryMessage,
+    targetContainer: raw.targetContainer, downloadUrl: `/api/files/${raw.jobId}`,
+  };
+}
 
 const describeFormatSelector = (selector: string): string => {
   const stream = selector.match(/^yt:(video|merge|raw|audio-source):([A-Za-z0-9_.-]+)$/);
@@ -146,9 +192,61 @@ export const useAppStore = create<AppState>((set, get) => ({
   setActiveJobId: (activeJobId) => set({ activeJobId }),
   activeJobs: {},
   wsInstance: null,
+  queueRecoveryError: null, downloadNotice: null, duplicateJobId: null,
+  dismissDownloadNotice: () => set({ downloadNotice: null, duplicateJobId: null }),
+  recoverDownloads: () => {
+    if (recoveryRequest) return recoveryRequest;
+    const before = new Set(Object.keys(get().activeJobs));
+    recoveryRequest = (async () => {
+      let recoveryFailure = 'The saved queue is temporarily unavailable. Pullio will reconnect when the server returns; you can also retry recovery.';
+      try {
+        const response = await fetch('/api/jobs', { signal: AbortSignal.timeout(15_000), cache: 'no-store' });
+        if (!response.headers.get('content-type')?.includes('application/json')) {
+          recoveryFailure = 'The download queue API is unavailable. Restart the updated Pullio server, then retry recovery.';
+          throw new Error(recoveryFailure);
+        }
+        const data = await response.json();
+        if (!response.ok || !Array.isArray(data.jobs)) throw new Error('The saved transfer queue could not be loaded.');
+        const recovered: Record<string, DownloadState> = {};
+        for (const raw of data.jobs) {
+          const job = stateFromServer(raw); if (!job || dismissedDownloadIds.has(job.jobId)) continue;
+          const current = get().activeJobs[job.jobId];
+          recovered[job.jobId] = current && (current.updatedAt || 0) > (job.updatedAt || 0) ? current : job;
+        }
+        for (const [id, current] of Object.entries(get().activeJobs)) if (!before.has(id) && !recovered[id]) recovered[id] = current;
+        set({ activeJobs: recovered, downloadState: recovered[get().activeJobId || ''] || null, queueRecoveryError: data.persistenceError || null });
+        for (const job of Object.values(recovered)) if (job.status === 'completed') rememberCompletedDownload(job);
+        if (Object.keys(recovered).length) {
+          const ws = get().ensureWebSocketConnected();
+          if (ws?.readyState === WebSocket.OPEN) for (const id of Object.keys(recovered)) ws.send(JSON.stringify({ type: 'subscribe', jobId: id }));
+        }
+      } catch { set({ queueRecoveryError: recoveryFailure }); }
+      finally { recoveryRequest = null; }
+    })();
+    return recoveryRequest;
+  },
+  acceptDownloadResponse: (data) => {
+    const job = stateFromServer(data?.job);
+    if (!job || job.jobId !== data.jobId) throw new Error('The server did not return valid transfer details. Restart the updated Pullio server and retry.');
+    set({ activeJobs: { ...get().activeJobs, [job.jobId]: job }, activeJobId: job.jobId, downloadState: job, activeTab: 'transfers',
+      ...(data.duplicate ? { downloadNotice: `This media and format are already ${job.status === 'completed' ? 'downloaded' : 'in your queue'}. The existing transfer was opened.`, duplicateJobId: job.jobId } : {}) });
+    get().setActiveTab('transfers');
+    if (job.status === 'completed') rememberCompletedDownload(job, !data.duplicate);
+    const ws = get().ensureWebSocketConnected();
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'subscribe', jobId: job.jobId }));
+  },
+  downloadAnotherCopy: async (jobId) => {
+    const job = get().activeJobs[jobId]; if (!job) throw new Error('This download is unavailable.');
+    const response = await fetch('/api/queue', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(45_000), body: JSON.stringify({
+      url: job.url, itag: job.formatSelector || 'best', type: job.type, provider: job.provider, title: job.title, thumbnail: job.thumbnail,
+      targetContainer: job.targetContainer, filenameTemplate: get().preferences.filenameTemplate, allowDuplicate: true,
+    }) });
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Could not queue another copy.');
+    get().acceptDownloadResponse(data); get().dismissDownloadNotice();
+  },
 
-  activeTab: 'downloader',
-  setActiveTab: (activeTab) => set({ activeTab }),
+  activeTab: savedActiveTab(),
+  setActiveTab: (activeTab) => { set({ activeTab }); try { localStorage.setItem('pullio_active_tab', activeTab); } catch {} },
   audioStudioSource: null,
   setAudioStudioSource: (audioStudioSource) => set({ audioStudioSource }),
 
@@ -272,6 +370,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ wsInstance: ws });
 
     ws.onopen = () => {
+      void get().recoverDownloads();
       // Re-subscribe to all currently active or pending jobs
       const currentActive = get().activeJobs;
       Object.keys(currentActive).forEach((id) => {
@@ -293,11 +392,13 @@ export const useAppStore = create<AppState>((set, get) => ({
         const message = JSON.parse(event.data);
         if (message.type === 'progress' && message.job) {
           const { jobId: msgJobId, progress, speed, eta, status, error, fileSize, bytesDownloaded, itag, title: msgTitle, thumbnail: msgThumbnail, queuePosition } = message.job;
+          if (dismissedDownloadIds.has(msgJobId)) return;
 
           const targetJob = get().activeJobs[msgJobId];
           const formatSelector = String(itag || targetJob?.formatSelector || targetJob?.format || 'best');
           const jobProvider: ProviderType = targetJob?.provider || (get().metadata?.provider as ProviderType) || get().provider || 'generic';
           const updatedJob: DownloadState = {
+            ...targetJob,
             jobId: msgJobId,
             isDownloading: status === 'downloading' || status === 'queued',
             progress: typeof progress === 'number' ? progress : 0,
@@ -312,10 +413,12 @@ export const useAppStore = create<AppState>((set, get) => ({
             title: msgTitle || targetJob?.title || get().metadata?.title || 'Media Download',
             thumbnail: msgThumbnail || targetJob?.thumbnail || get().metadata?.thumbnail || '',
             type: targetJob?.type || 'video',
-            url: targetJob?.url || '',
+            url: message.job.url || targetJob?.url || '',
             provider: jobProvider,
             queuePosition: Number.isInteger(queuePosition) ? queuePosition : undefined,
             downloadUrl: `/api/files/${msgJobId}`,
+            stage: message.job.stage, stageProgress: message.job.stageProgress, createdAt: message.job.createdAt,
+            updatedAt: message.job.updatedAt, recoveryMessage: message.job.recoveryMessage, targetContainer: message.job.targetContainer,
           };
 
           const jobs = { ...get().activeJobs, [msgJobId]: updatedJob };
@@ -326,31 +429,8 @@ export const useAppStore = create<AppState>((set, get) => ({
           });
 
           // Handle completion: add to persistent history and auto-save for single transfers
-          if (status === 'completed') {
-            get().addToHistory({
-              id: msgJobId,
-              jobId: msgJobId,
-              url: updatedJob.url || get().url || '',
-              title: updatedJob.title || 'Downloaded Media',
-              thumbnail: updatedJob.thumbnail || '',
-              provider: jobProvider,
-              format: updatedJob.format || 'Best',
-              type: updatedJob.type || 'video',
-              fileSize: updatedJob.fileSize || 'Complete',
-              timestamp: Date.now(),
-              downloadUrl: `/api/files/${msgJobId}`,
-            });
-
-            // Only auto-trigger browser download if single item to avoid browser popup blocks
-            const currentJobKeys = Object.keys(get().activeJobs);
-            if (currentJobKeys.length <= 1) {
-              const link = document.createElement('a');
-              link.href = `/api/files/${msgJobId}`;
-              link.setAttribute('download', '');
-              document.body.appendChild(link);
-              link.click();
-              document.body.removeChild(link);
-            }
+          if (status === 'completed' && targetJob?.status !== 'completed') {
+            rememberCompletedDownload(updatedJob, Boolean(targetJob));
           }
         }
 
@@ -377,6 +457,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     };
 
     ws.onclose = () => {
+      if (get().wsInstance !== ws) return;
       set({ wsInstance: null });
       // Auto-reconnect if any transfers are still in progress
       const pending = Object.values(get().activeJobs).filter(
@@ -387,7 +468,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       );
       if (pending.length > 0 || pendingConversions) {
         setTimeout(() => {
-          get().ensureWebSocketConnected();
+            if (get().wsInstance === null) get().ensureWebSocketConnected();
         }, 1500);
       }
     };
@@ -409,45 +490,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     } else {
       ws?.addEventListener('open', sendSubscriptions, { once: true });
     }
-  },
-
-  startRealtimeDownload: (jobId, title, thumbnail, type = 'video', originalUrl, provider, queuePosition) => {
-    const ws = get().ensureWebSocketConnected();
-
-    // Subscribe to the new job immediately if socket is already open
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'subscribe', jobId }));
-    }
-
-    const targetTitle = title || get().metadata?.title || 'Media Download';
-    const targetThumbnail = thumbnail || get().metadata?.thumbnail || '';
-    const jobProvider = provider || (get().metadata?.provider as ProviderType) || get().provider || 'generic';
-    const newJob: DownloadState = {
-      jobId,
-      isDownloading: true,
-      progress: 0,
-      speed: 'Starting...',
-      eta: 'Calculating...',
-      status: 'queued',
-      fileSize: '0 MB',
-      bytesDownloaded: '0 MB',
-      format: 'Best',
-      title: targetTitle,
-      thumbnail: targetThumbnail,
-      type,
-      url: originalUrl || get().metadata?.url || '',
-      provider: jobProvider,
-      queuePosition,
-      downloadUrl: `/api/files/${jobId}`
-    };
-
-    const currentJobs = { ...get().activeJobs, [jobId]: newJob };
-    set({
-      activeJobId: jobId,
-      activeJobs: currentJobs,
-      downloadState: newJob,
-      activeTab: 'transfers',
-    });
   },
 
   retryJob: async (jobId: string) => {
@@ -477,6 +519,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
       const retryData = await res.json().catch(() => null);
       if (!res.ok) {
+        if (res.status !== 404) throw new Error(retryData?.error || 'Could not retry this transfer.');
         // Fallback: If job was purged from server memory (e.g. after server restart), re-queue via /api/queue
         const queueRes = await fetch('/api/queue', {
           method: 'POST',
@@ -491,25 +534,19 @@ export const useAppStore = create<AppState>((set, get) => ({
             maxConcurrentDownloads: get().preferences.maxConcurrentDownloads,
             filenameTemplate: get().preferences.filenameTemplate,
             filenameQuality: job.format || 'best',
+            type: job.type, targetContainer: job.targetContainer,
           }),
         });
         const queueData = await queueRes.json().catch(() => null);
         if (queueRes.ok && typeof queueData?.jobId === 'string' && queueData.jobId) {
-          get().removeJob(jobId);
-          get().startRealtimeDownload(
-            queueData.jobId,
-            job.title,
-            job.thumbnail,
-            job.type || 'video',
-            job.url,
-            job.provider,
-            queueData.queuePosition
-          );
+          await get().removeJob(jobId);
+          get().acceptDownloadResponse(queueData);
           return;
         }
         throw new Error('Failed to re-queue job on server');
       }
 
+      if (retryData?.job) get().acceptDownloadResponse(retryData);
       if (Number.isInteger(retryData?.queuePosition)) {
         const queuedJob = { ...get().activeJobs[jobId], queuePosition: retryData.queuePosition };
         set({
@@ -541,10 +578,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  removeJob: (jobId: string) => {
-    // Notify server to cancel running processes and purge temp files
-    fetch(`/api/jobs/${jobId}`, { method: 'DELETE' }).catch(() => {});
-
+  removeJob: async (jobId: string) => {
+    const previous = get().activeJobs[jobId];
+    dismissedDownloadIds.add(jobId);
     const remainingJobs = { ...get().activeJobs };
     delete remainingJobs[jobId];
     set({
@@ -552,12 +588,27 @@ export const useAppStore = create<AppState>((set, get) => ({
       downloadState: get().activeJobId === jobId ? null : get().downloadState,
       activeJobId: get().activeJobId === jobId ? null : get().activeJobId,
     });
+    try {
+      const response = await fetch(`/api/jobs/${jobId}`, { method: 'DELETE', signal: AbortSignal.timeout(15_000) });
+      if (!response.ok) throw new Error('The transfer could not be removed from the server.');
+    } catch {
+      dismissedDownloadIds.delete(jobId);
+      set({ activeJobs: previous ? { ...get().activeJobs, [jobId]: previous } : get().activeJobs,
+        queueRecoveryError: 'The transfer could not be removed. Check the connection and try again.' });
+    }
   },
 
-  clearCompletedJobs: () => {
+  clearCompletedJobs: async () => {
+    const ids = Object.values(get().activeJobs).filter(job => job.status === 'completed' || job.status === 'failed').map(job => job.jobId);
+    if (!ids.length) return;
+    const response = await fetch('/api/jobs', { method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(15_000), body: JSON.stringify({ jobIds: ids }) });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Could not clear finished transfers.');
+    ids.forEach(id => dismissedDownloadIds.add(id));
     const remainingJobs: Record<string, DownloadState> = {};
     Object.entries(get().activeJobs).forEach(([id, job]) => {
-      if (job.status !== 'completed' && job.status !== 'failed') {
+      if (!ids.includes(id)) {
         remainingJobs[id] = job;
       }
     });
@@ -574,7 +625,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (!job) return {};
       const updatedJobs = applyQueueSnapshot({
         ...state.activeJobs,
-        [jobId]: { ...job, status: 'paused', isDownloading: false, queuePosition: undefined, speed: 'Paused', eta: 'Waiting to resume' },
+        [jobId]: stateFromServer(data.job) || { ...job, stage: 'paused', status: 'paused', isDownloading: false, queuePosition: undefined, speed: 'Paused', eta: 'Waiting to resume' },
       }, data.queue);
       return {
         activeJobs: updatedJobs,
@@ -589,9 +640,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       const job = state.activeJobs[jobId];
       if (!job) return {};
       const status: DownloadState['status'] = data.status === 'downloading' ? 'downloading' : 'queued';
-      const resumedJob = {
+      const resumedJob: DownloadState = stateFromServer(data.job) || {
         ...job,
         status,
+        stage: 'queued',
         isDownloading: status === 'queued' || status === 'downloading',
         queuePosition: Number.isInteger(data.queuePosition) ? data.queuePosition : undefined,
         speed: status === 'queued' ? '0 MB/s' : 'Starting...',
@@ -620,17 +672,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const targetId = jobId || get().activeJobId;
     if (!targetId) return;
 
-    // Notify server to kill process
-    fetch(`/api/jobs/${targetId}`, { method: 'DELETE' }).catch(() => {});
-
-    const remainingJobs = { ...get().activeJobs };
-    delete remainingJobs[targetId];
-
-    set({
-      activeJobs: remainingJobs,
-      downloadState: get().activeJobId === targetId ? null : get().downloadState,
-      activeJobId: get().activeJobId === targetId ? null : get().activeJobId,
-    });
+    void get().removeJob(targetId);
   },
 
   reset: () => {

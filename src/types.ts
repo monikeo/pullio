@@ -50,6 +50,12 @@ export interface DownloadState {
   speed: string;
   eta: string;
   status: 'queued' | 'paused' | 'downloading' | 'completed' | 'failed';
+  stage?: import('./lib/downloads').DownloadStage;
+  stageProgress?: number;
+  createdAt?: number;
+  updatedAt?: number;
+  recoveryMessage?: string;
+  targetContainer?: string;
   queuePosition?: number;
   error?: string;
   downloadUrl?: string;

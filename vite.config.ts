@@ -12,6 +12,7 @@ export default defineConfig(() => {
       },
     },
     server: {
+      fs: { deny: ['.env', '.env.*', '*.{crt,pem}', '**/.git/**', '**/pullio-data/**', '**/downloads/**', '**/uploads/**', '**/converted/**', '**/cookies*.txt'] },
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
@@ -25,6 +26,7 @@ export default defineConfig(() => {
           '**/downloads/*',
           '**/uploads/**',
           '**/converted/**',
+          '**/pullio-data/**',
           '**/dist/**',
           '**/*.part',
           '**/*.ytdl',

@@ -14,6 +14,10 @@ import multer from "multer";
 import { AudioEnhancementSettings, AudioExportFormat, buildAudioEnhancementFilters, buildAudioCleanupFilters, getAudioEncoderArgs, validateAudioEnhancement, validateAudioExport } from "./src/lib/audioEnhancement";
 import { AudioEditSettings, resolveAudioEdit, validateAudioEdit } from './src/lib/audioEditing';
 import { readAudioWaveform } from './src/lib/audioWaveform.server';
+import { ZipFile } from 'yazl';
+import { DownloadRecord, downloadIdentity, isDemoMediaUrl, publicDownloadRecord } from './src/lib/downloads';
+import { DownloadJournal } from './src/lib/downloadJournal.server';
+import { runDownloadWorker } from './src/lib/downloadWorker.server';
 
 const execFileAsync = promisify(execFile);
 
@@ -85,7 +89,8 @@ function normalizeMediaUrl(rawUrl: string): string {
   if (url.includes('bilibili.com') && !url.includes('/video/')) {
     const bvidMatch = url.match(/[?&]bvid=(BV[a-zA-Z0-9]+)/i);
     if (bvidMatch && bvidMatch[1]) {
-      return `https://www.bilibili.com/video/${bvidMatch[1]}`;
+      const part = url.match(/[?&]p=(\d+)/)?.[1];
+      return `https://www.bilibili.com/video/${bvidMatch[1]}${part ? `?p=${part}` : ''}`;
     }
   }
 
@@ -192,6 +197,7 @@ async function resolveShortMediaUrl(targetUrl: string): Promise<string> {
 
 /** Validate media URL for safety and SSRF prevention */
 function isValidMediaUrl(inputUrl: string): { valid: boolean; error?: string } {
+  if (typeof inputUrl !== 'string' || inputUrl.length > 8000) return { valid: false, error: 'Enter a media URL of up to 8,000 characters.' };
   try {
     const parsed = new URL(inputUrl);
     if (!['http:', 'https:'].includes(parsed.protocol)) {
@@ -884,11 +890,11 @@ async function getYtDlpPlaylistInfo(url: string, retry = 0): Promise<any> {
 /** Helper to clean up any files associated with a jobId (e.g., partial or failed downloads) */
 function cleanJobFiles(jobId: string) {
   try {
-    const downloadsDir = path.join(process.cwd(), "downloads");
+    const downloadsDir = DOWNLOADS_DIR;
     if (!fs.existsSync(downloadsDir)) return;
     const files = fs.readdirSync(downloadsDir);
     files.forEach(f => {
-      if (f.startsWith(jobId)) {
+      if (f.startsWith(`${jobId}.`) && !archiveInputs.has(path.join(downloadsDir, f))) {
         fs.unlinkSync(path.join(downloadsDir, f));
       }
     });
@@ -927,21 +933,21 @@ function serveMockPlaylist(res: any, provider: string, url: string, activeTrack?
       title: activeTrack ? `Sunrise Serenade (Curated B-Side)` : `Track 1: Ambient Sunrise Serenade`,
       thumbnail: "https://images.unsplash.com/photo-1470225620780-dba8ba36b745?auto=format&fit=crop&q=80&w=200",
       duration: 195,
-      url: `https://www.youtube.com/watch?v=BigBuckBunny&list=${listId}&track=1`
+      url: 'https://demo.pullio.invalid/video?item=1'
     },
     {
       id: `pl-${listId}-2`,
       title: `Track 2: Midnight City Drives`,
       thumbnail: "https://images.unsplash.com/photo-1519501025264-65ba15a82390?auto=format&fit=crop&q=80&w=200",
       duration: 242,
-      url: `https://www.youtube.com/watch?v=SoundHelix-Song-1&list=${listId}&track=2`
+      url: 'https://demo.pullio.invalid/audio?item=2'
     },
     {
       id: `pl-${listId}-3`,
       title: `Track 3: Neon Rain Chillout`,
       thumbnail: "https://images.unsplash.com/photo-1515621061946-eff1c2a352bd?auto=format&fit=crop&q=80&w=200",
       duration: 178,
-      url: `https://www.youtube.com/watch?v=SoundHelix-Song-2&list=${listId}&track=3`
+      url: 'https://demo.pullio.invalid/audio?item=3'
     }
   );
 
@@ -1038,9 +1044,10 @@ function serveMockSingleVideo(res: any, provider: string, url: string) {
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || (process.env.K_SERVICE ? "0.0.0.0" : "127.0.0.1");
-const DOWNLOADS_DIR = path.join(process.cwd(), "downloads");
-const UPLOADS_DIR = path.join(process.cwd(), "uploads");
-const CONVERTED_DIR = path.join(process.cwd(), "converted");
+const STORAGE_ROOT = path.resolve(process.env.PULLIO_STORAGE_DIR || process.cwd());
+const DOWNLOADS_DIR = path.join(STORAGE_ROOT, "downloads");
+const UPLOADS_DIR = path.join(STORAGE_ROOT, "uploads");
+const CONVERTED_DIR = path.join(STORAGE_ROOT, "converted");
 
 // Ensure directories exist
 [DOWNLOADS_DIR, UPLOADS_DIR, CONVERTED_DIR].forEach((dir) => {
@@ -1433,32 +1440,7 @@ async function processConversionJob(jobId: string) {
 }
 
 
-// In-Memory Queue State
-interface DownloadJob {
-  jobId: string;
-  url: string;
-  itag: string | number;
-  targetContainer?: string;
-  provider: string;
-  progress: number;
-  speed: string;
-  eta: string;
-  status: 'queued' | 'paused' | 'downloading' | 'completed' | 'failed';
-  queuePosition?: number;
-  fileSize: string;
-  bytesDownloaded: string;
-  error?: string;
-  filePath?: string;
-  fileName?: string;
-  mimeType?: string;
-  title: string;
-  thumbnail: string;
-  type: 'video' | 'audio';
-  filenameTemplate: string;
-  filenameQuality?: string;
-  outputFileName?: string;
-  retryCount?: number;
-}
+type DownloadJob = DownloadRecord;
 
 const DEFAULT_FILENAME_TEMPLATE = "{title} - {platform}";
 const FILENAME_TEMPLATE_TOKENS = new Set(["title", "platform", "date", "quality", "ext"]);
@@ -1502,6 +1484,80 @@ function makeDownloadFileName(job: DownloadJob, extension: string): string {
 }
 
 const jobQueue = new Map<string, DownloadJob>();
+const downloadJournal = new DownloadJournal(path.join(STORAGE_ROOT, 'pullio-data', 'download-queue.json'));
+let lastQueueSave = 0;
+let shuttingDown = false;
+const archiveInputs = new Map<string, number>();
+const isDemoUrl = (url: string) => isDemoMediaUrl(url, process.env.PULLIO_ENABLE_DEMOS === '1' && process.env.NODE_ENV !== 'production');
+
+function persistDownloadQueue(force = false) {
+  if (!force && Date.now() - lastQueueSave < 1000) return;
+  lastQueueSave = Date.now();
+  downloadJournal.save({ version: 1, maxConcurrentDownloads, jobs: [...jobQueue.values()] });
+}
+
+async function recoverDownloadQueue() {
+  const saved = await downloadJournal.load() as any;
+  if (!saved || saved.version !== 1 || !Array.isArray(saved.jobs)) return;
+  if (Number.isInteger(saved.maxConcurrentDownloads) && saved.maxConcurrentDownloads >= 1 && saved.maxConcurrentDownloads <= 4) maxConcurrentDownloads = saved.maxConcurrentDownloads;
+  const restored: DownloadJob[] = [];
+  for (const raw of saved.jobs.slice(0, 500)) {
+    if (!raw || !/^[a-f0-9-]{36}$/i.test(raw.jobId) || typeof raw.url !== 'string' || raw.url.length > 8000 || !isValidMediaUrl(raw.url).valid || !['video', 'audio'].includes(raw.type) || !['queued', 'downloading', 'paused', 'completed', 'failed'].includes(raw.status)) continue;
+    if (!(typeof raw.itag === 'string' && raw.itag.length > 0 && raw.itag.length <= 256) && !(typeof raw.itag === 'number' && Number.isFinite(raw.itag))) continue;
+    const status = raw.status === 'downloading' ? 'queued' : raw.status;
+    const text = (value: unknown, fallback: string, max = 300) => typeof value === 'string' ? value.replace(/[\u0000-\u001f]/g, '').slice(0, max) : fallback;
+    const job: DownloadJob = {
+      jobId: raw.jobId, url: raw.url, itag: raw.itag, type: raw.type, status, stage: status,
+      provider: text(raw.provider, 'generic', 30), title: text(raw.title, 'Recovered download'), thumbnail: text(raw.thumbnail, '', 2000),
+      targetContainer: ['mp4', 'mkv', 'webm', 'mp3', 'm4a'].includes(raw.targetContainer) ? raw.targetContainer : raw.type === 'audio' ? 'mp3' : 'mkv',
+      filenameTemplate: validateFilenameTemplate(raw.filenameTemplate) || DEFAULT_FILENAME_TEMPLATE, filenameQuality: text(raw.filenameQuality, '', 32),
+      progress: Math.max(0, Math.min(100, Number(raw.progress) || 0)), speed: status === 'paused' ? 'Paused' : '0 MB/s', eta: status === 'queued' ? 'Recovering queue…' : '--:--',
+      fileSize: text(raw.fileSize, 'Unknown', 32), bytesDownloaded: text(raw.bytesDownloaded, '0 MB', 32), downloadedBytes: Number.isFinite(raw.downloadedBytes) ? Math.max(0, raw.downloadedBytes) : 0,
+      createdAt: Number.isFinite(raw.createdAt) ? raw.createdAt : Date.now(), updatedAt: Number.isFinite(raw.updatedAt) ? raw.updatedAt : Date.now(),
+      queuePosition: Number.isInteger(raw.queuePosition) ? raw.queuePosition : undefined,
+      outputFileName: text(raw.outputFileName, '', 180), mimeType: text(raw.mimeType, 'application/octet-stream', 100),
+      error: raw.status === 'failed' ? text(raw.error, 'Download interrupted') : undefined,
+      recoveryMessage: status === 'queued' ? 'Recovered after server restart. Continuing available partial files.' : status === 'paused' ? 'Recovered paused download.' : undefined,
+    };
+    if (typeof raw.fileName === 'string' && path.basename(raw.fileName) === raw.fileName && raw.fileName.startsWith(`${job.jobId}.`)) {
+      const candidate = path.join(DOWNLOADS_DIR, raw.fileName);
+      if (fs.existsSync(candidate)) {
+        const resolved = fs.realpathSync(candidate);
+        if (resolved.startsWith(`${fs.realpathSync(DOWNLOADS_DIR)}${path.sep}`) && fs.statSync(resolved).isFile()) {
+          job.fileName = raw.fileName; job.filePath = resolved;
+        }
+      }
+    }
+    if (status === 'completed' && (!job.filePath || !fs.existsSync(job.filePath))) {
+      job.status = 'failed'; job.stage = 'failed'; job.error = 'The saved file has expired or was removed. Retry to download it again.';
+    }
+    if (status === 'completed') job.progress = 100;
+    if (jobQueue.has(job.jobId)) continue;
+    jobQueue.set(job.jobId, job); restored.push(job);
+  }
+  restored.filter(job => job.status === 'queued').sort((a, b) => (a.queuePosition ?? 0) - (b.queuePosition ?? 0) || a.createdAt - b.createdAt).forEach(job => {
+    pendingDownloadQueue.push(job.jobId); pendingDownloadJobIds.add(job.jobId);
+  });
+  refreshPendingDownloadQueuePositions();
+}
+
+function duplicateDownload(candidate: DownloadJob, allowDuplicate: unknown): DownloadJob | undefined {
+  if (allowDuplicate === true) return;
+  const identity = downloadIdentity(candidate);
+  return [...jobQueue.values()].find(job => job.status !== 'failed' && downloadIdentity(job) === identity && (job.status !== 'completed' || Boolean(job.filePath && fs.existsSync(job.filePath))));
+}
+
+async function stopDownloadProcess(jobId: string) {
+  const child = activeChildProcesses.get(jobId);
+  if (!child || child.exitCode !== null) return;
+  await new Promise<void>((resolve) => {
+    const finish = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} finish(); }, 5000);
+    child.once('close', finish);
+    if (process.platform === 'win32') execFile('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true }, () => { if (child.exitCode !== null) finish(); });
+    else { try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch { finish(); } } }
+  });
+}
 
 function resolveAudioStudioSource(value: unknown): { path: string; originalName: string; size: number; uploadId: string } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Choose an audio source first.');
@@ -1539,14 +1595,14 @@ function resolveAudioStudioSource(value: unknown): { path: string; originalName:
 
 const wsSubscriptions = new Map<string, Set<WebSocket>>();
 const activeChildProcesses = new Map<string, any>();
-const activeDownloadRequests = new Map<string, any>();
-const activeDownloadFileStreams = new Map<string, any>();
 const lastBroadcastTime = new Map<string, number>();
 
 /** Throttled WebSocket broadcaster to eliminate event-loop saturation and UI lag */
 function broadcastJobUpdate(jobId: string, force = false) {
   const job = jobQueue.get(jobId);
   if (!job) return;
+  job.updatedAt = Date.now();
+  persistDownloadQueue(force);
 
   const now = Date.now();
   const lastTime = lastBroadcastTime.get(jobId) || 0;
@@ -1560,7 +1616,7 @@ function broadcastJobUpdate(jobId: string, force = false) {
   if (subscribers) {
     const payload = JSON.stringify({
       type: "progress",
-      job,
+      job: publicDownloadRecord(job),
     });
     subscribers.forEach((ws) => {
       if (ws.readyState === WebSocket.OPEN) {
@@ -1579,6 +1635,7 @@ interface ExtWebSocket extends WebSocket {
 }
 
 async function startServer() {
+  await recoverDownloadQueue();
   const app = express();
   const server = http.createServer(app);
 
@@ -1634,7 +1691,7 @@ async function startServer() {
           const job = jobQueue.get(jobId);
           if (job && ws.readyState === WebSocket.OPEN) {
             try {
-              ws.send(JSON.stringify({ type: "progress", job }));
+              ws.send(JSON.stringify({ type: "progress", job: publicDownloadRecord(job) }));
             } catch {}
           }
 
@@ -1709,13 +1766,99 @@ async function startServer() {
   });
 
   app.use(express.json());
+  const archiveTickets = new Map<string, { ids: string[]; expires: number }>();
+  let activeArchives = 0;
 
-  app.post("/api/queue/config", (req, res) => {
+  const archiveFiles = (ids: string[]) => ids.map(id => {
+    const job = jobQueue.get(id);
+    if (!job || job.status !== 'completed' || !job.filePath || !fs.existsSync(job.filePath)) throw new Error('One or more files are unavailable. Refresh Transfers and retry.');
+    const resolved = fs.realpathSync(job.filePath);
+    if (!resolved.startsWith(`${fs.realpathSync(DOWNLOADS_DIR)}${path.sep}`)) throw new Error('Invalid download file.');
+    return { path: resolved, name: path.basename((job.outputFileName || makeDownloadFileName(job, path.extname(resolved))).replace(/\\/g, '/')).replace(/[<>:"|?*\u0000-\u001f]/g, '_'), size: fs.statSync(resolved).size };
+  });
+
+  app.post('/api/downloads/archive', (req, res) => {
+    for (const [ticket, data] of archiveTickets) if (data.expires < Date.now()) archiveTickets.delete(ticket);
+    const ids = req.body?.jobIds;
+    if (!Array.isArray(ids) || ids.length < 1 || ids.length > 500 || !ids.every(id => typeof id === 'string' && isValidJobId(id))) return res.status(400).json({ error: 'Choose 1–500 completed downloads.' });
+    if (archiveTickets.size >= 20) return res.status(429).json({ error: 'Too many ZIP requests. Wait a moment and retry.' });
+    if (activeArchives >= 4) return res.status(429).json({ error: 'Other ZIP downloads are running. Retry in a moment.' });
+    try {
+      const unique = [...new Set<string>(ids)]; archiveFiles(unique);
+      const ticket = crypto.randomUUID();
+      archiveTickets.set(ticket, { ids: unique, expires: Date.now() + 5 * 60_000 });
+      res.json({ downloadUrl: `/api/downloads/archive/${ticket}`, count: unique.length });
+    } catch (error) { res.status(409).json({ error: (error as Error).message }); }
+  });
+
+  app.get('/api/downloads/archive/:ticket', (req, res) => {
+    const ticket = archiveTickets.get(req.params.ticket);
+    if (!ticket || ticket.expires < Date.now()) return res.status(404).json({ error: 'This ZIP request expired. Create it again from Transfers.' });
+    if (activeArchives >= 4) return res.status(429).json({ error: 'Other ZIP downloads are running. Retry in a moment.' });
+    let cleanup: (() => void) | undefined;
+    try {
+      const files = archiveFiles(ticket.ids);
+      if (req.method === 'HEAD') return res.type('application/zip').setHeader('Cache-Control', 'no-store').end();
+      archiveTickets.delete(req.params.ticket); activeArchives++;
+      const zip = new ZipFile(); const readers = new Set<fs.ReadStream>(); let finished = false;
+      const release = () => {
+        if (finished) return; finished = true; activeArchives--;
+        for (const file of files) { const count = (archiveInputs.get(file.path) || 1) - 1; if (count) archiveInputs.set(file.path, count); else archiveInputs.delete(file.path); }
+        for (const reader of readers) reader.destroy();
+        (zip.outputStream as any).destroy();
+      };
+      cleanup = release;
+      for (const file of files) {
+        archiveInputs.set(file.path, (archiveInputs.get(file.path) || 0) + 1);
+        try { fs.utimesSync(file.path, new Date(), new Date()); } catch {}
+      }
+      res.once('finish', release); res.once('close', release);
+      zip.on('error', () => { if (!res.headersSent) res.status(500).json({ error: 'Could not read a ZIP input file.' }); else res.destroy(); release(); });
+      zip.outputStream.on('error', () => { res.destroy(); release(); });
+      const names = new Set<string>();
+      for (const file of files) {
+        const extension = path.extname(file.name); const base = path.basename(file.name, extension).replace(/^\.+$/, '') || 'download';
+        let name = `${base}${extension}`; let index = 2;
+        while (names.has(name.toLowerCase())) name = `${base} (${index++})${extension}`;
+        names.add(name.toLowerCase());
+        zip.addReadStreamLazy(name, { size: file.size, compress: false }, (callback) => {
+          if (finished) { callback(new Error('ZIP download was closed.'), undefined as any); return; }
+          const reader = fs.createReadStream(file.path); readers.add(reader); reader.once('close', () => readers.delete(reader)); callback(null, reader);
+        });
+      }
+      res.attachment(`Pullio-downloads-${new Date().toISOString().slice(0, 10)}.zip`); res.type('application/zip'); res.setHeader('Cache-Control', 'no-store');
+      zip.outputStream.pipe(res); zip.end();
+    } catch (error) { cleanup?.(); if (res.headersSent) res.destroy(); else res.status(409).json({ error: (error as Error).message }); }
+  });
+
+  app.get('/api/jobs', (_req, res) => {
+    for (const job of jobQueue.values()) {
+      if (job.status === 'completed' && (!job.filePath || !fs.existsSync(job.filePath))) {
+        job.status = 'failed'; job.stage = 'failed'; job.error = 'The saved file has expired or was removed. Retry to download it again.';
+        job.filePath = undefined; job.fileName = undefined; broadcastJobUpdate(job.jobId, true);
+      }
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ jobs: [...jobQueue.values()].map(publicDownloadRecord), persistenceError: downloadJournal.error || downloadJournal.recoveryWarning, maxConcurrentDownloads });
+  });
+
+  app.delete('/api/jobs', async (req, res) => {
+    const ids = req.body?.jobIds;
+    if (!Array.isArray(ids) || !ids.length || ids.length > 500 || !ids.every(id => typeof id === 'string' && isValidJobId(id))) return res.status(400).json({ error: 'Choose 1–500 finished transfers to clear.' });
+    const unique = [...new Set<string>(ids)];
+    if (unique.some(id => { const job = jobQueue.get(id); return job && !['completed', 'failed'].includes(job.status); })) return res.status(409).json({ error: 'A selected transfer is still active. Refresh Transfers and try again.' });
+    for (const id of unique) { jobQueue.delete(id); cleanJobFiles(id); lastBroadcastTime.delete(id); wsSubscriptions.delete(id); }
+    persistDownloadQueue(true); await downloadJournal.flush();
+    res.json({ removedIds: unique });
+  });
+
+  app.post("/api/queue/config", async (req, res) => {
     const requestedLimit = req.body?.maxConcurrentDownloads;
     if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 4) {
       return res.status(400).json({ error: "maxConcurrentDownloads must be an integer from 1 to 4." });
     }
     setMaxConcurrentDownloads(requestedLimit);
+    await downloadJournal.flush();
     return res.json({ maxConcurrentDownloads, activeDownloads: activeDownloadsCount });
   });
 
@@ -1760,7 +1903,7 @@ async function startServer() {
 
       // Automatically extract URL if raw mobile share text was submitted
       url = extractMediaUrlFromText(url);
-      const isMockUrl = url.includes("mock") || url.includes("demo-") || url.includes("example.com") || url.includes("test-videos.co.uk") || url.includes("track=");
+      const isMockUrl = isDemoUrl(url);
 
       if (!isMockUrl) {
         const initialUrlCheck = isValidMediaUrl(url);
@@ -2018,6 +2161,9 @@ async function startServer() {
       if (!url || !itag) {
         return res.status(400).json({ error: "URL and itag are required" });
       }
+      if ((typeof itag !== 'string' || !itag.length || itag.length > 256) && !(typeof itag === 'number' && Number.isFinite(itag))) return res.status(400).json({ error: 'Choose a valid media format.' });
+      if ([title, thumbnail, provider].some(value => value !== undefined && typeof value !== 'string')) return res.status(400).json({ error: 'Invalid media details.' });
+      title = title?.slice(0, 300); thumbnail = thumbnail?.slice(0, 2000); provider = provider?.slice(0, 30);
       if (type !== undefined && type !== 'video' && type !== 'audio') {
         return res.status(400).json({ error: "Type must be video or audio." });
       }
@@ -2032,7 +2178,7 @@ async function startServer() {
       }
 
       url = extractMediaUrlFromText(url);
-      const isMock = url.includes("mock") || url.includes("demo-") || url.includes("example.com") || url.includes("test-videos.co.uk") || url.includes("track=");
+      const isMock = isDemoUrl(url);
       if (!isMock) {
         const initialUrlCheck = isValidMediaUrl(url);
         if (!initialUrlCheck.valid) {
@@ -2059,6 +2205,7 @@ async function startServer() {
 
       const newJob: DownloadJob = {
         jobId,
+        stage: 'queued', createdAt: Date.now(), updatedAt: Date.now(),
         url,
         itag,
         targetContainer,
@@ -2081,12 +2228,16 @@ async function startServer() {
           : targetContainer === 'mkv' ? "video/x-matroska" : `video/${targetContainer}`,
       };
 
+      const duplicate = duplicateDownload(newJob, req.body.allowDuplicate);
+      if (duplicate) return res.json({ jobId: duplicate.jobId, duplicate: true, job: publicDownloadRecord(duplicate), status: duplicate.status, queuePosition: duplicate.queuePosition });
+      if (jobQueue.size >= 500) return res.status(429).json({ error: 'The queue is full. Clear finished downloads before adding more.' });
       jobQueue.set(jobId, newJob);
 
       // Trigger background download worker via concurrency limiter
       enqueueDownloadJob(jobId);
 
-      return res.json({ jobId, status: newJob.status, queuePosition: newJob.queuePosition });
+      persistDownloadQueue(true); await downloadJournal.flush();
+      return res.json({ jobId, status: newJob.status, queuePosition: newJob.queuePosition, job: publicDownloadRecord(newJob) });
     } catch (err: any) {
       console.error("Queueing error:", err);
       res.status(500).json({ error: err.message || "Queue insertion failed" });
@@ -2097,6 +2248,7 @@ async function startServer() {
   app.post("/api/queue/direct", async (req, res) => {
     try {
       let { url, quality = '1080p', type = 'video', filenameTemplate: requestedFilenameTemplate, maxConcurrentDownloads: requestedLimit } = req.body;
+      if (!['video', 'audio'].includes(type) || typeof quality !== 'string' || quality.length > 256) return res.status(400).json({ error: 'Choose a valid media type and quality.' });
       if (!url) {
         return res.status(400).json({ error: "URL is required" });
       }
@@ -2111,7 +2263,7 @@ async function startServer() {
       }
 
       url = extractMediaUrlFromText(url);
-      const isMock = url.includes("mock") || url.includes("demo-") || url.includes("example.com") || url.includes("test-videos.co.uk") || url.includes("track=");
+      const isMock = isDemoUrl(url);
       if (!isMock) {
         const initialUrlCheck = isValidMediaUrl(url);
         if (!initialUrlCheck.valid) {
@@ -2184,6 +2336,7 @@ async function startServer() {
 
       const newJob: DownloadJob = {
         jobId,
+        stage: 'queued', createdAt: Date.now(), updatedAt: Date.now(), targetContainer: ext,
         url,
         itag: matchedItag,
         provider,
@@ -2203,8 +2356,12 @@ async function startServer() {
         mimeType: isAudio ? "audio/mpeg" : "video/mp4",
       };
 
+      const duplicate = duplicateDownload(newJob, req.body.allowDuplicate);
+      if (duplicate) return res.json({ jobId: duplicate.jobId, duplicate: true, job: publicDownloadRecord(duplicate), status: duplicate.status, queuePosition: duplicate.queuePosition, title: duplicate.title });
+      if (jobQueue.size >= 500) return res.status(429).json({ error: 'The queue is full. Clear finished downloads before adding more.' });
       jobQueue.set(jobId, newJob);
       enqueueDownloadJob(jobId);
+      persistDownloadQueue(true); await downloadJournal.flush();
 
       return res.json({
         success: true,
@@ -2215,7 +2372,8 @@ async function startServer() {
         duration,
         format: { itag: matchedItag, quality: `${matchedItag} ${ext.toUpperCase()}`, type: isAudio ? 'audio' : 'video' },
         status: newJob.status,
-        queuePosition: newJob.queuePosition
+        queuePosition: newJob.queuePosition,
+        job: publicDownloadRecord(newJob)
       });
     } catch (err: any) {
       log.error("DIRECT_QUEUE", "Direct queue error", err);
@@ -2295,9 +2453,9 @@ async function startServer() {
     res.attachment(job.outputFileName || makeDownloadFileName(job, actualExt));
     res.header("Content-Type", job.mimeType || "application/octet-stream");
     res.header("X-Content-Type-Options", "nosniff");
-
-    const fileStream = fs.createReadStream(job.filePath);
-    fileStream.pipe(res);
+    res.setHeader('Cache-Control', 'no-store');
+    try { const now = new Date(); fs.utimesSync(job.filePath, now, now); } catch {}
+    res.sendFile(job.filePath);
   });
 
   // Serve high-resolution thumbnail proxy download with SSRF and size safeguards
@@ -2358,6 +2516,7 @@ async function startServer() {
 
   // Get job status via HTTP polling fallback
   app.get("/api/jobs/:jobId", (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     const { jobId } = req.params;
     if (!isValidJobId(jobId)) {
       return res.status(400).json({ error: "Invalid job ID format" });
@@ -2366,47 +2525,50 @@ async function startServer() {
     if (!job) {
       return res.status(404).json({ error: "Job not found" });
     }
-    return res.json({
-      ...job,
-      downloadUrl: job.status === "completed" ? `/api/download/${jobId}` : undefined,
-    });
+    return res.json(publicDownloadRecord(job));
   });
 
-  // Waiting jobs can be paused, resumed, or reordered in the server queue.
-  app.post("/api/jobs/:jobId/pause", (req, res) => {
+  app.post("/api/jobs/:jobId/pause", async (req, res) => {
     const { jobId } = req.params;
     if (!isValidJobId(jobId)) return res.status(400).json({ error: "Invalid job ID format" });
     const job = jobQueue.get(jobId);
     if (!job) return res.status(404).json({ error: "Job not found" });
-    if (job.status !== "queued" || !pendingDownloadJobIds.has(jobId)) {
-      return res.status(409).json({ error: "Only jobs waiting in the queue can be paused. Active downloads can be cancelled." });
+    if (job.status !== 'queued' && job.status !== 'downloading') {
+      return res.status(409).json({ error: 'Only active or queued downloads can be paused.' });
     }
 
     removePendingDownloadJob(jobId);
     job.status = "paused";
+    job.stage = 'paused';
     job.queuePosition = undefined;
     job.speed = "Paused";
     job.eta = "Waiting to resume";
     broadcastJobUpdate(jobId, true);
-    return res.json({ jobId, status: job.status, queue: getPendingDownloadQueueSnapshot() });
+    await stopDownloadProcess(jobId);
+    await activeDownloadWorkers.get(jobId);
+    persistDownloadQueue(true); await downloadJournal.flush();
+    return res.json({ jobId, status: job.status, job: publicDownloadRecord(job), queue: getPendingDownloadQueueSnapshot() });
   });
 
-  app.post("/api/jobs/:jobId/resume", (req, res) => {
+  app.post("/api/jobs/:jobId/resume", async (req, res) => {
     const { jobId } = req.params;
     if (!isValidJobId(jobId)) return res.status(400).json({ error: "Invalid job ID format" });
     const job = jobQueue.get(jobId);
     if (!job) return res.status(404).json({ error: "Job not found" });
     if (job.status !== "paused") return res.status(409).json({ error: "This job is not paused." });
+    if (activeChildProcesses.has(jobId) || activeDownloadSlots.has(jobId)) return res.status(409).json({ error: 'This download is still pausing. Retry in a moment.' });
 
     job.status = "queued";
+    job.stage = 'queued'; job.error = undefined;
     job.speed = "0 MB/s";
     job.eta = "Waiting in queue";
     enqueueDownloadJob(jobId);
     broadcastJobUpdate(jobId, true);
-    return res.json({ jobId, status: job.status, queuePosition: job.queuePosition, queue: getPendingDownloadQueueSnapshot() });
+    persistDownloadQueue(true); await downloadJournal.flush();
+    return res.json({ jobId, status: job.status, job: publicDownloadRecord(job), queuePosition: job.queuePosition, queue: getPendingDownloadQueueSnapshot() });
   });
 
-  app.post("/api/jobs/:jobId/reorder", (req, res) => {
+  app.post("/api/jobs/:jobId/reorder", async (req, res) => {
     const { jobId } = req.params;
     const direction = req.body?.direction;
     if (!isValidJobId(jobId)) return res.status(400).json({ error: "Invalid job ID format" });
@@ -2427,11 +2589,12 @@ async function startServer() {
 
     [pendingDownloadQueue[currentIndex], pendingDownloadQueue[targetIndex]] = [pendingDownloadQueue[targetIndex], pendingDownloadQueue[currentIndex]];
     refreshPendingDownloadQueuePositions();
+    await downloadJournal.flush();
     return res.json({ jobId, queuePosition: job.queuePosition, queue: getPendingDownloadQueueSnapshot() });
   });
 
   // Re-enqueue/retry a failed job with adaptive recovery
-  app.post("/api/jobs/:jobId/retry", (req, res) => {
+  app.post("/api/jobs/:jobId/retry", async (req, res) => {
     const { jobId } = req.params;
     if (!isValidJobId(jobId)) {
       return res.status(400).json({ error: "Invalid job ID format" });
@@ -2441,56 +2604,40 @@ async function startServer() {
     if (!job) {
       return res.status(404).json({ error: "Job not found" });
     }
-    if (job.status === "queued" || job.status === "downloading") {
-      return res.status(409).json({ error: "This job is already queued or downloading." });
+    if (job.status !== 'failed') {
+      return res.status(409).json({ error: 'Only failed downloads can be retried. Resume paused downloads or create another copy of completed files.' });
     }
 
-    cleanJobFiles(jobId);
     job.status = "queued";
-    job.progress = 0;
+    job.stage = 'queued';
     job.speed = "0 MB/s";
     job.eta = "Re-queueing...";
     job.error = undefined;
     job.retryCount = (job.retryCount || 0) + 1;
 
-    // On user manual retry, switch to universal reliable format if specific format failed
-    if (job.retryCount > 1) {
-      job.itag = job.type === 'video' ? 'best' : 'bestaudio';
-    }
-
     enqueueDownloadJob(jobId);
     broadcastJobUpdate(jobId, true);
     log.info("QUEUE", `Manual retry triggered for job ${jobId} (Attempt ${job.retryCount + 1})`);
+    persistDownloadQueue(true); await downloadJournal.flush();
 
-    return res.json({ jobId, status: job.status, queuePosition: job.queuePosition, message: "Job re-queued successfully" });
+    return res.json({ jobId, status: job.status, job: publicDownloadRecord(job), queuePosition: job.queuePosition, message: "Job re-queued successfully" });
   });
 
   // Cancel running job or clear from server memory
-  app.delete("/api/jobs/:jobId", (req, res) => {
+  app.delete("/api/jobs/:jobId", async (req, res) => {
     const { jobId } = req.params;
     if (!isValidJobId(jobId)) {
       return res.status(400).json({ error: "Invalid job ID format" });
     }
 
-    // Kill running process if active
-    const proc = activeChildProcesses.get(jobId);
-    if (proc) {
-      try { 
-        proc.kill("SIGKILL"); 
-      } catch {}
-      activeChildProcesses.delete(jobId);
-      log.info("WORKER", `Terminated active child process for cancelled job ${jobId}`);
-    }
-    const downloadRequest = activeDownloadRequests.get(jobId);
-    if (downloadRequest) downloadRequest.destroy();
-    const downloadFileStream = activeDownloadFileStreams.get(jobId);
-    if (downloadFileStream) downloadFileStream.destroy();
-
     removePendingDownloadJob(jobId);
-    cleanJobFiles(jobId);
     jobQueue.delete(jobId);
+    await stopDownloadProcess(jobId);
+    await activeDownloadWorkers.get(jobId);
+    cleanJobFiles(jobId);
     lastBroadcastTime.delete(jobId);
     wsSubscriptions.delete(jobId);
+    persistDownloadQueue(true); await downloadJournal.flush();
 
     return res.json({ success: true, message: "Job cancelled and purged from server" });
   });
@@ -2958,6 +3105,7 @@ async function startServer() {
             '**/downloads/*',
             '**/uploads/**',
             '**/converted/**',
+            '**/pullio-data/**',
             '**/scratch/**',
             '**/*.log'
           ]
@@ -2976,14 +3124,27 @@ async function startServer() {
 
   server.listen(PORT, HOST, () => {
     console.log(`Server running on http://${HOST}:${PORT}`);
+    tryProcessNextJob();
   });
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    persistDownloadQueue(true); await downloadJournal.flush();
+    await Promise.all([...activeChildProcesses.keys()].map(stopDownloadProcess));
+    await Promise.all(activeDownloadWorkers.values());
+    await downloadJournal.flush();
+    server.close(); wss.close(); process.exit(0);
+  };
+  process.once('SIGINT', () => void shutdown());
+  process.once('SIGTERM', () => void shutdown());
 }
 
 // Shared job failure helper — safe to call from inside callbacks
 function failJob(jobId: string, reason: string) {
   const job = jobQueue.get(jobId);
-  if (!job || job.status === "completed" || job.status === "failed") return;
+  if (!job || job.status === "completed" || job.status === "failed" || job.status === 'paused') return;
   job.status = "failed";
+  job.stage = 'failed';
   job.queuePosition = undefined;
   job.error = reason;
   activeChildProcesses.delete(jobId);
@@ -2997,9 +3158,11 @@ let activeDownloadsCount = 0;
 const pendingDownloadQueue: string[] = [];
 const pendingDownloadJobIds = new Set<string>();
 const activeDownloadSlots = new Set<string>();
+const activeDownloadWorkers = new Map<string, Promise<void>>();
 
 function setMaxConcurrentDownloads(limit: number) {
   maxConcurrentDownloads = limit;
+  persistDownloadQueue(true);
   log.info("QUEUE", `Maximum concurrent downloads set to ${limit}`);
   tryProcessNextJob();
 }
@@ -3035,19 +3198,22 @@ function enqueueDownloadJob(jobId: string) {
 }
 
 function tryProcessNextJob() {
+  if (shuttingDown) return;
   while (activeDownloadsCount < maxConcurrentDownloads && pendingDownloadQueue.length > 0) {
     const jobId = pendingDownloadQueue.shift();
     if (!jobId) continue;
     pendingDownloadJobIds.delete(jobId);
+    if (jobQueue.get(jobId)?.status !== 'queued') continue;
     if (activeDownloadSlots.has(jobId)) continue;
     activeDownloadSlots.add(jobId);
     activeDownloadsCount++;
     refreshPendingDownloadQueuePositions();
-    void processDownloadJob(jobId).catch((err) => {
+    const worker = processDownloadJob(jobId).catch((err) => {
       log.error("QUEUE", `Unhandled worker error for job ${jobId}`, err);
       failJob(jobId, `Worker exception: ${err?.message || 'Unknown error'}`);
       releaseDownloadSlot(jobId);
-    });
+    }).finally(() => { if (activeDownloadWorkers.get(jobId) === worker) activeDownloadWorkers.delete(jobId); });
+    activeDownloadWorkers.set(jobId, worker);
   }
 }
 
@@ -3057,345 +3223,48 @@ function releaseDownloadSlot(jobId: string) {
   tryProcessNextJob();
 }
 
-// Reliable fallback media URLs (public domain test files)
-const FALLBACK_VIDEO_URL = "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/720/Big_Buck_Bunny_720_10s_1MB.mp4";
-const FALLBACK_AUDIO_URL = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3";
-
-// Background Download Processor using native yt-dlp spawn
+// Download workers preserve partial files and report explicit processing stages.
 async function processDownloadJob(jobId: string) {
   const job = jobQueue.get(jobId);
-  if (!job) {
-    releaseDownloadSlot(jobId);
-    return;
-  }
-
-  job.status = "downloading";
-  job.queuePosition = undefined;
-  broadcastJobUpdate(jobId, true);
-
-  // Clean up any stale files from prior attempts
-  cleanJobFiles(jobId);
-
-  // If this is a mock playlist item or custom offline link, skip yt-dlp and go straight to fallback stream
-  const isMockUrl = job.url.includes("track=") || job.url.includes("demo-") || job.url.includes("mock") || job.url.includes("example.com") || job.url.includes("test-videos.co.uk");
-  if (isMockUrl) {
-    log.info("WORKER", `Mock/Offline URL detected for job ${jobId} — streaming fallback test file`);
-    const fallback = job.type === "audio" ? FALLBACK_AUDIO_URL : FALLBACK_VIDEO_URL;
-    return streamDownload(jobId, fallback);
-  }
-
+  if (!job || job.status !== 'queued') { releaseDownloadSlot(jobId); return; }
+  job.status = 'downloading'; job.queuePosition = undefined;
   try {
-    const formatArg = getYtDlpFormatArg(job.itag, job.type);
-    
-    // Output template: downloads/[jobId].[ext]
-    const outPath = path.join(DOWNLOADS_DIR, `${jobId}.%(ext)s`);
-
-    const args = [
-      "--newline",
-      "--progress",
-      "--no-playlist",
-      "--no-warnings",
-      ...getYtDlpRuntimeArgs(),
-      "-f", formatArg,
-      "-o", outPath,
-    ];
-
-    if (FFMPEG_DIR) {
-      args.push("--ffmpeg-location", FFMPEG_DIR);
-    }
-
-    const isAudioDownload = job.type === 'audio' || isAudioFormatToken(job.itag);
-    const keepOriginalAudio = String(job.itag).toLowerCase().startsWith("yt:audio-source:");
-    if (isAudioDownload && !keepOriginalAudio && FFMPEG_DIR) {
-      let audioBitrate = "320k";
-      const itagLower = String(job.itag).toLowerCase();
-      if (itagLower.includes("128")) audioBitrate = "128k";
-      else if (itagLower.includes("192")) audioBitrate = "192k";
-      else if (itagLower.includes("256")) audioBitrate = "256k";
-      else if (itagLower.includes("320")) audioBitrate = "320k";
-
-      args.push("-x", "--audio-format", job.targetContainer || "mp3", "--audio-quality", audioBitrate);
-    } else if (!isAudioDownload && FFMPEG_DIR) {
-      const videoContainer = job.targetContainer || "mkv";
-      args.push("--merge-output-format", videoContainer, "--remux-video", videoContainer);
-    }
-
-    args.push(job.url);
-
-    log.info("WORKER", `Spawning yt-dlp for job ${jobId} [Format: ${formatArg}]`);
-    const child = spawn(YT_DLP_PATH, args, { timeout: 600000 }); // 10 min timeout
-    activeChildProcesses.set(jobId, child);
-
-    let stderrOutput = "";
-    
-    child.stdout.on("data", (data) => {
-      const output = data.toString();
-      const lines = output.split(/[\r\n]+/);
-      for (const line of lines) {
-        if (line.includes("[download]")) {
-          const pctMatch = line.match(/([\d.]+)%/);
-          const sizeMatch = line.match(/of\s+(?:~)?([\d.]+\w+)/);
-          const speedMatch = line.match(/at\s+([\d.]+\w+\/s)/);
-          const etaMatch = line.match(/ETA\s+([\d:]+)/);
-
-          let updated = false;
-
-          if (pctMatch) {
-            job.progress = parseFloat(pctMatch[1]);
-            updated = true;
-          }
-          if (sizeMatch) {
-            job.fileSize = sizeMatch[1];
-            updated = true;
-          }
-          if (speedMatch) {
-            job.speed = speedMatch[1];
-            updated = true;
-          }
-          if (etaMatch) {
-            job.eta = etaMatch[1];
-            updated = true;
-          }
-
-          if (pctMatch && sizeMatch) {
-            const pct = parseFloat(pctMatch[1]);
-            const sizeStr = sizeMatch[1];
-            const val = parseFloat(sizeStr);
-            const unit = sizeStr.replace(/[\d.]/g, '').trim();
-            const totalMB = unit.toLowerCase().startsWith('g') ? val * 1024 : (unit.toLowerCase().startsWith('k') ? val / 1024 : val);
-            job.bytesDownloaded = ((pct / 100) * totalMB).toFixed(1) + " MB";
-          }
-
-          if (updated) {
-            broadcastJobUpdate(jobId);
-          }
-        }
-      }
+    const demo = isDemoUrl(job.url);
+    await runDownloadWorker(job, {
+      directory: DOWNLOADS_DIR, executable: YT_DLP_PATH, format: getYtDlpFormatArg(job.itag, job.type),
+      runtimeArgs: demo ? [] : getYtDlpRuntimeArgs(), ffmpeg: ffmpegPath || '', ffmpegDirectory: FFMPEG_DIR,
+      demo, processes: activeChildProcesses,
+      current: () => jobQueue.get(jobId) === job && job.status === 'downloading' && !shuttingDown,
+      update: (force) => broadcastJobUpdate(jobId, force),
+      stop: () => stopDownloadProcess(jobId),
+      complete: (filePath) => {
+        const extension = path.extname(filePath).toLowerCase();
+        const mime: Record<string, string> = {
+          '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.webm': 'video/webm', '.mov': 'video/quicktime',
+          '.m4a': 'audio/mp4', '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.opus': 'audio/opus',
+          '.flac': 'audio/flac', '.aac': 'audio/aac', '.wav': 'audio/wav',
+        };
+        job.filePath = filePath; job.fileName = path.basename(filePath);
+        job.outputFileName = makeDownloadFileName(job, extension);
+        job.mimeType = mime[extension] || 'application/octet-stream';
+        job.status = 'completed'; job.stage = 'completed'; job.progress = 100; job.stageProgress = 100;
+        job.downloadedBytes = fs.statSync(filePath).size; job.totalBytes = job.downloadedBytes;
+        job.fileSize = formatBytes(job.downloadedBytes); job.bytesDownloaded = job.fileSize;
+        job.speed = '0 MB/s'; job.eta = '00:00'; job.error = undefined; job.recoveryMessage = undefined;
+        broadcastJobUpdate(jobId, true);
+      },
     });
-
-    child.stderr.on("data", (data) => {
-      stderrOutput += data.toString();
-    });
-
-    child.on("close", (code) => {
-      activeChildProcesses.delete(jobId);
-      if (jobQueue.get(jobId) !== job || job.status === "failed") {
-        releaseDownloadSlot(jobId);
-        return;
-      }
-
-      if (code === 0) {
-        try {
-          const files = fs.readdirSync(DOWNLOADS_DIR);
-          const downloadedFile = files.find(f => f.startsWith(jobId) && !f.endsWith('.part') && !f.endsWith('.ytdl'));
-
-          if (downloadedFile) {
-            const actualExt = path.extname(downloadedFile).toLowerCase();
-            const actualFilePath = path.join(DOWNLOADS_DIR, downloadedFile);
-
-            job.filePath = actualFilePath;
-            job.fileName = downloadedFile;
-            job.outputFileName = makeDownloadFileName(job, actualExt);
-            job.progress = 100;
-            job.status = "completed";
-            job.speed = "0 MB/s";
-            job.bytesDownloaded = job.fileSize;
-            job.eta = "00:00";
-
-            if (actualExt === ".mp4") job.mimeType = job.type === "audio" ? "audio/mp4" : "video/mp4";
-            else if (actualExt === ".webm") job.mimeType = job.type === "audio" ? "audio/webm" : "video/webm";
-            else if (actualExt === ".mkv") job.mimeType = job.type === "audio" ? "audio/x-matroska" : "video/x-matroska";
-            else if (actualExt === ".mov") job.mimeType = "video/quicktime";
-            else if (actualExt === ".avi") job.mimeType = "video/x-msvideo";
-            else if (actualExt === ".flv") job.mimeType = "video/x-flv";
-            else if (actualExt === ".wmv") job.mimeType = "video/x-ms-wmv";
-            else if (actualExt === ".m4v") job.mimeType = "video/x-m4v";
-            else if (actualExt === ".ts") job.mimeType = "video/mp2t";
-            else if (actualExt === ".gif") job.mimeType = "image/gif";
-            else if (actualExt === ".m4a") job.mimeType = "audio/mp4";
-            else if (actualExt === ".mp3") job.mimeType = "audio/mpeg";
-            else if (actualExt === ".ogg") job.mimeType = "audio/ogg";
-            else if (actualExt === ".opus") job.mimeType = "audio/opus";
-            else if (actualExt === ".flac") job.mimeType = "audio/flac";
-            else if (actualExt === ".aac") job.mimeType = "audio/aac";
-            else if (actualExt === ".wav") job.mimeType = "audio/wav";
-            else job.mimeType = "application/octet-stream";
-
-            broadcastJobUpdate(jobId, true);
-            log.info("WORKER", `Download completed successfully for job ${jobId}: ${downloadedFile}`);
-          } else {
-            log.warn("WORKER", `yt-dlp succeeded for job ${jobId} but file was not found in directory`);
-            failJob(jobId, "Download process finished but file could not be located on disk.");
-          }
-        } catch (err: any) {
-          log.error("WORKER", `Error scanning output directory for job ${jobId}`, err);
-          failJob(jobId, `Error scanning output: ${err.message}`);
-        }
-      } else {
-        const classified = classifyMediaError(stderrOutput, job.provider);
-        log.warn("WORKER", `yt-dlp failed with exit code ${code} for job ${jobId}: [${classified.category}] ${classified.message}`);
-
-        // Intelligent Auto-Recovery: If format was unavailable or transient failure and retryCount === 0, retry with adaptive universal format
-        if ((job.retryCount || 0) < 1 && classified.retryable) {
-          job.retryCount = (job.retryCount || 0) + 1;
-          log.info("WORKER", `[Auto-Recovery] Retrying job ${jobId} with universal adaptive fallback format (Attempt ${job.retryCount + 1})`);
-          
-          job.itag = job.type === 'video' ? 'best' : 'bestaudio';
-          job.status = 'queued';
-          job.progress = 0;
-          job.eta = 'Auto-retrying with standard stream...';
-          broadcastJobUpdate(jobId, true);
-          cleanJobFiles(jobId);
-
-          setTimeout(() => {
-            enqueueDownloadJob(jobId);
-          }, 800);
-          releaseDownloadSlot(jobId);
-          return;
-        }
-
-        failJob(jobId, classified.message);
-      }
-      releaseDownloadSlot(jobId);
-    });
-
-    child.on("error", (err) => {
-      activeChildProcesses.delete(jobId);
-      log.error("WORKER", `Failed to spawn yt-dlp child process for job ${jobId}`, err);
-      failJob(jobId, `Failed to initialize media download engine: ${err.message}`);
-      releaseDownloadSlot(jobId);
-    });
-
-  } catch (err: any) {
-    activeChildProcesses.delete(jobId);
-    log.error("WORKER", `Unexpected worker exception for job ${jobId}`, err);
-    failJob(jobId, `Worker exception: ${err.message}`);
-    releaseDownloadSlot(jobId);
-  }
-}
-
-function streamDownload(jobId: string, url: string, attempt = 1) {
-  const job = jobQueue.get(jobId);
-  if (!job) {
-    releaseDownloadSlot(jobId);
-    return;
-  }
-
-  // Clean up any prior files to ensure fresh fallback writing
-  cleanJobFiles(jobId);
-
-  const req = https.get(url, { headers: { "User-Agent": "Mozilla/5.0" } }, (response) => {
-    // Follow redirects (301/302/307/308)
-    if (response.statusCode && [301, 302, 307, 308].includes(response.statusCode) && response.headers.location) {
-      response.resume(); // discard body
-      if (attempt > 5) {
-        failJob(jobId, "Too many redirects");
-        finishRequest();
-        return;
-      }
-      detachRequest();
-      return streamDownload(jobId, response.headers.location, attempt + 1);
-    }
-
-    if (response.statusCode && response.statusCode >= 400) {
-      response.resume();
-      // Retry with fallback on first attempt
-      if (attempt === 1) {
-        console.warn(`[Queue ${jobId}] Status ${response.statusCode} — retrying with fallback`);
-        const fallback = job.type === "audio" ? FALLBACK_AUDIO_URL : FALLBACK_VIDEO_URL;
-        detachRequest();
-        return streamDownload(jobId, fallback, 2);
-      }
-      failJob(jobId, `HTTP ${response.statusCode}`);
-      finishRequest();
-      return;
-    }
-
-    const totalBytes = parseInt(response.headers["content-length"] || "0", 10);
-    job.fileSize = totalBytes > 0 ? (totalBytes / (1024 * 1024)).toFixed(1) + " MB" : "Unknown";
-
-    const fileStream = fs.createWriteStream(job.filePath!);
-    activeDownloadFileStreams.set(jobId, fileStream);
-    let bytesDownloaded = 0;
-    let lastReportBytes = 0;
-    let lastReportTime = Date.now();
-
-    response.on("data", (chunk: Buffer) => {
-      fileStream.write(chunk);
-      bytesDownloaded += chunk.length;
-
-      const now = Date.now();
-      const elapsed = (now - lastReportTime) / 1000;
-
-      if (elapsed >= 0.25) {
-        const speedBps = (bytesDownloaded - lastReportBytes) / elapsed;
-        const progress = totalBytes > 0 ? (bytesDownloaded / totalBytes) * 100 : Math.min(job.progress + 3, 95);
-
-        let eta = "Calculating...";
-        if (speedBps > 0 && totalBytes > 0) {
-          const rem = Math.ceil((totalBytes - bytesDownloaded) / speedBps);
-          eta = `${String(Math.floor(rem / 60)).padStart(2, "0")}:${String(rem % 60).padStart(2, "0")}`;
-        }
-
-        job.progress = Math.min(progress, 99.5);
-        job.speed = (speedBps / (1024 * 1024)).toFixed(1) + " MB/s";
-        job.bytesDownloaded = (bytesDownloaded / (1024 * 1024)).toFixed(1) + " MB";
-        job.eta = eta;
-
-        lastReportBytes = bytesDownloaded;
-        lastReportTime = now;
-        broadcastJobUpdate(jobId);
-      }
-    });
-
-    response.on("end", () => {
-      fileStream.end(() => {
-        const actualExt = job.filePath ? path.extname(job.filePath).replace('.', '').toLowerCase() : (job.type === "audio" ? "mp3" : "mp4");
-        job.outputFileName = makeDownloadFileName(job, actualExt);
-        job.progress = 100;
-        job.status = "completed";
-        job.speed = "0 MB/s";
-        job.bytesDownloaded = job.fileSize;
-        job.eta = "00:00";
-        broadcastJobUpdate(jobId);
-        finishRequest();
-      });
-    });
-
-    response.on("error", (err) => {
-      failJob(jobId, err.message);
-      finishRequest(true);
-    });
-
-    fileStream.on("error", (err) => {
-      failJob(jobId, err.message);
-      finishRequest();
-    });
-  });
-  activeDownloadRequests.set(jobId, req);
-
-  req.on("error", (err) => {
-    if (activeDownloadRequests.get(jobId) !== req) return;
-    failJob(jobId, err.message);
-    finishRequest(true);
-  });
-  req.setTimeout(30000, () => {
-    req.destroy();
-    failJob(jobId, "Request timed out");
-    finishRequest(true);
-  });
-
-  function detachRequest() {
-    if (activeDownloadRequests.get(jobId) !== req) return;
-    activeDownloadRequests.delete(jobId);
-    activeDownloadFileStreams.delete(jobId);
-  }
-
-  function finishRequest(destroyFileStream = false) {
-    if (activeDownloadRequests.get(jobId) !== req) return;
-    const fileStream = activeDownloadFileStreams.get(jobId);
-    detachRequest();
-    if (destroyFileStream && fileStream && !fileStream.destroyed) fileStream.destroy();
+  } catch (error) {
+    if (jobQueue.get(jobId) !== job || job.status !== 'downloading' || shuttingDown) return;
+    const reason = error instanceof Error ? error.message : 'The download could not finish.';
+    const classified = classifyMediaError(reason, job.provider);
+    if ((job.retryCount || 0) < 1 && classified.retryable) {
+      job.retryCount = (job.retryCount || 0) + 1;
+      job.status = 'queued'; job.stage = 'queued'; job.eta = 'Retrying the requested format…';
+      broadcastJobUpdate(jobId, true);
+      setTimeout(() => { if (jobQueue.get(jobId) === job && job.status === 'queued') enqueueDownloadJob(jobId); }, 800);
+    } else failJob(jobId, reason.startsWith('This download stopped') ? reason : classified.message);
+  } finally {
     releaseDownloadSlot(jobId);
   }
 }
@@ -3417,12 +3286,16 @@ setInterval(() => {
         const filePath = path.join(DOWNLOADS_DIR, file);
         const stats = fs.statSync(filePath);
         if (activeInputPaths.has(path.resolve(filePath))) return;
-        const fileJobId = path.basename(file, path.extname(file));
-        if (jobQueue.get(fileJobId)?.status === 'downloading' || jobQueue.get(fileJobId)?.status === 'queued') return;
-        if (now - stats.mtimeMs > expiryMs) {
+        if (!stats.isFile() || archiveInputs.has(filePath)) return;
+        const fileJobId = file.split('.')[0];
+        const owner = jobQueue.get(fileJobId);
+        if (owner && ['downloading', 'queued', 'paused'].includes(owner.status)) return;
+        if (now - stats.mtimeMs > 24 * 60 * 60_000) {
           fs.unlinkSync(filePath);
-          const jobId = path.basename(file, path.extname(file));
-          jobQueue.delete(jobId);
+          if (owner?.status === 'completed') {
+            owner.status = 'failed'; owner.stage = 'failed'; owner.error = 'The saved file expired after 24 hours. Retry to download it again.';
+            owner.filePath = undefined; owner.fileName = undefined; broadcastJobUpdate(owner.jobId, true);
+          }
         }
       });
     }

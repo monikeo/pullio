@@ -61,7 +61,7 @@ function formatProviderName(p: string): string {
 }
 
 export default function AnalyzePanel() {
-  const { metadata, startRealtimeDownload, preferences } = useAppStore();
+  const { metadata, acceptDownloadResponse, preferences } = useAppStore();
   const [mode, setMode] = useState<'smart' | 'advanced'>('smart');
   const [selectedItag, setSelectedItag] = useState<string | number | null>(null);
   const [playlistDownloadType, setPlaylistDownloadType] = useState<'video' | 'audio'>('video');
@@ -216,7 +216,7 @@ export default function AnalyzePanel() {
         throw new Error('The download server returned an invalid job response. Please retry.');
       }
 
-      startRealtimeDownload(data.jobId, targetTitle, targetThumbnail, isAudio ? 'audio' : 'video', targetUrl, metadata.provider, data.queuePosition);
+      acceptDownloadResponse(data);
     } catch (err: unknown) {
       console.error(err);
       setError(err instanceof Error && err.name === 'TimeoutError'
@@ -272,7 +272,7 @@ export default function AnalyzePanel() {
           if (!res.ok) throw new Error(data?.error || `Failed to queue ${track.title}`);
           if (typeof data?.jobId !== 'string' || !data.jobId) throw new Error(`The server did not confirm ${track.title}`);
 
-          startRealtimeDownload(data.jobId, track.title, track.thumbnail, isAudio ? 'audio' : 'video', track.url, metadata.provider, data.queuePosition);
+          acceptDownloadResponse(data);
           queuedCount++;
         } catch (err: any) {
           console.error(`Playlist item queue failed for ${track.title}:`, err);

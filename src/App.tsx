@@ -64,7 +64,7 @@ export default function App() {
     audioStudioSource, setAudioStudioSource,
     pwaInstallPrompt, setPwaInstallPrompt,
     isPwaInstalled, setIsPwaInstalled, triggerInstall,
-    preferences, startRealtimeDownload
+    preferences, acceptDownloadResponse, recoverDownloads
   } = useAppStore();
 
   const [isAboutOpen, setIsAboutOpen] = useState(false);
@@ -87,6 +87,13 @@ export default function App() {
   const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const activeJobsCount = Object.keys(activeJobs).length;
+  useEffect(() => {
+    void recoverDownloads();
+    const recover = () => { if (!document.hidden) void recoverDownloads(); };
+    window.addEventListener('online', recover); window.addEventListener('focus', recover);
+    const timer = setInterval(() => { if (useAppStore.getState().activeTab === 'transfers') recover(); }, 30_000);
+    return () => { clearInterval(timer); window.removeEventListener('online', recover); window.removeEventListener('focus', recover); };
+  }, [recoverDownloads]);
   const navigationHidden = useScrollNavigation(`${activeTab}:${isAnalyzing}`);
   useEffect(() => { window.scrollTo({ top: 0, behavior: 'auto' }); }, [activeTab]);
 
@@ -259,17 +266,9 @@ export default function App() {
         throw new Error('The server did not confirm the download job. Please retry.');
       }
 
-      startRealtimeDownload(
-        data.jobId,
-        data.title,
-        data.thumbnail,
-        data.format?.type || 'video',
-        cleanUrl,
-        data.provider,
-        data.queuePosition
-      );
+      acceptDownloadResponse(data);
       setActiveTab('transfers');
-      showToast(`⚡ Downloading: ${(data.title || 'Media').slice(0, 30)}...`);
+      showToast(data.duplicate ? 'Opened the existing transfer for this media and format.' : `Queued: ${(data.title || 'Media').slice(0, 30)}…`);
       setUrl('');
       setMetadata(null);
     } catch (err: any) {
@@ -427,15 +426,7 @@ export default function App() {
             if (typeof data?.jobId !== 'string' || !data.jobId) {
               throw new Error('The server did not confirm a download job.');
             }
-            useAppStore.getState().startRealtimeDownload(
-              data.jobId,
-              mediaItem.title || 'Batch Item',
-              mediaItem.thumbnail,
-              isAudio ? 'audio' : 'video',
-              mediaItem.url,
-              mediaItem.provider,
-              data.queuePosition
-            );
+            useAppStore.getState().acceptDownloadResponse(data);
             queuedCount++;
           } catch (err: any) {
             console.error(`Batch queue failed for ${mediaItem.url}:`, err);
@@ -453,7 +444,7 @@ export default function App() {
       setActiveTab(queuedCount > 0 ? 'transfers' : 'downloader');
       showToast(failedUrls.length > 0
         ? `Queued ${queuedCount} downloads. Failed links are ready to retry.`
-        : `Queued ${queuedCount} download${queuedCount === 1 ? '' : 's'}.`);
+        : `Added or reused ${queuedCount} transfer${queuedCount === 1 ? '' : 's'}.`);
     } catch (err: any) {
       console.error('Batch processing stopped unexpectedly:', err);
       setAnalyzeError(err?.message || 'Batch processing stopped. Retry the remaining links.');
@@ -803,7 +794,7 @@ export default function App() {
                     Download Media <span className="text-[var(--accent)] transition-colors duration-200">Instantly</span>
                   </h1>
                   <p className="text-gray-400 text-xs sm:text-base md:text-lg mb-6 max-w-xl mx-auto leading-relaxed">
-                    Cinematic, stateless, universal video &amp; audio extractor. Supports YouTube, TikTok, Douyin (抖音), Instagram, Facebook, Bilibili, Vimeo, Pinterest, XiaoHongShu (小红书), and X.
+                    Universal video &amp; audio extractor. Supports YouTube, TikTok, Douyin (抖音), Instagram, Facebook, Bilibili, Vimeo, Pinterest, XiaoHongShu (小红书), and X.
                   </p>
                 </motion.div>
               )}

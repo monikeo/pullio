@@ -15,7 +15,7 @@ interface BatchDownloadModalProps {
 const EMPTY_URLS: string[] = [];
 
 export default function BatchDownloadModal({ isOpen, onClose, initialUrls = EMPTY_URLS }: BatchDownloadModalProps) {
-  const { startRealtimeDownload, setActiveTab, preferences } = useAppStore();
+  const { acceptDownloadResponse, setActiveTab, preferences } = useAppStore();
   const [rawText, setRawText] = useState(initialUrls.join('\n'));
   const [formatType, setFormatType] = useState<'video' | 'audio'>('video');
   const [videoQuality, setVideoQuality] = useState('best');
@@ -115,15 +115,7 @@ export default function BatchDownloadModal({ isOpen, onClose, initialUrls = EMPT
               continue;
             }
             queuedCount++;
-            startRealtimeDownload(
-              data.jobId,
-              mediaItem.title || `Batch ${mediaItem.provider.toUpperCase()} Item`,
-              mediaItem.thumbnail,
-              isAudio ? 'audio' : 'video',
-              mediaItem.url,
-              mediaItem.provider,
-              data.queuePosition
-            );
+            acceptDownloadResponse(data);
           } catch (err) {
             console.warn('Batch item could not be queued:', err);
             failedUrls.push(mediaItem.url);
