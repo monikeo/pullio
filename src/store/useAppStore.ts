@@ -74,6 +74,7 @@ interface AppState {
 import { sanitizeHistoryItem, sanitizeUserPreferences } from '../lib/security';
 import type { AudioStudioSource } from '../lib/audioEnhancement';
 import { DOWNLOAD_STAGE_LABELS, DownloadStage } from '../lib/downloads';
+import { notifyInBackground } from '../lib/notifications';
 
 let recoveryRequest: Promise<void> | null = null;
 const dismissedDownloadIds = new Set<string>();
@@ -239,7 +240,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const job = get().activeJobs[jobId]; if (!job) throw new Error('This download is unavailable.');
     const response = await fetch('/api/queue', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(45_000), body: JSON.stringify({
       url: job.url, itag: job.formatSelector || 'best', type: job.type, provider: job.provider, title: job.title, thumbnail: job.thumbnail,
-      targetContainer: job.targetContainer, filenameTemplate: get().preferences.filenameTemplate, allowDuplicate: true,
+      targetContainer: job.targetContainer, filenameTemplate: get().preferences.filenameTemplate, embedMetadata: get().preferences.embedMetadata, allowDuplicate: true,
     }) });
     const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Could not queue another copy.');
     get().acceptDownloadResponse(data); get().dismissDownloadNotice();
@@ -431,11 +432,20 @@ export const useAppStore = create<AppState>((set, get) => ({
           // Handle completion: add to persistent history and auto-save for single transfers
           if (status === 'completed' && targetJob?.status !== 'completed') {
             rememberCompletedDownload(updatedJob, Boolean(targetJob));
+            if (targetJob && get().preferences.notifyOnComplete) notifyInBackground('Download ready', updatedJob.title || 'Your file is ready to save.', `download-${msgJobId}`);
+          }
+          if (status === 'failed' && targetJob && targetJob.status !== 'failed' && get().preferences.notifyOnComplete) {
+            notifyInBackground('Download failed', `${updatedJob.title || 'A transfer'}: ${String(error || 'Open Pullio to retry.').slice(0, 120)}`, `download-${msgJobId}`);
           }
         }
 
         if (message.type === 'convert-progress' && message.job) {
           const { jobId: convJobId, status, progress, speed, eta, error, outputFileName, outputFileSize, downloadUrl } = message.job;
+          const previous = get().conversionQueue.find((item) => item.id === convJobId || item.uploadId === convJobId);
+          if (previous && previous.status !== status && get().preferences.notifyOnComplete) {
+            if (status === 'completed') notifyInBackground('Conversion finished', outputFileName || previous.fileName, `convert-${convJobId}`);
+            else if (status === 'failed') notifyInBackground('Conversion failed', `${previous.fileName}: ${String(error || '').slice(0, 120)}`, `convert-${convJobId}`);
+          }
           get().updateConversionItem(convJobId, {
             status,
             convertProgress: typeof progress === 'number' ? progress : 0,
@@ -532,7 +542,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             thumbnail: job.thumbnail,
             provider: job.provider || 'generic',
             maxConcurrentDownloads: get().preferences.maxConcurrentDownloads,
-            filenameTemplate: get().preferences.filenameTemplate,
+            filenameTemplate: get().preferences.filenameTemplate, embedMetadata: get().preferences.embedMetadata,
             filenameQuality: job.format || 'best',
             type: job.type, targetContainer: job.targetContainer,
           }),

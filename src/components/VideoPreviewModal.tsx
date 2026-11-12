@@ -4,6 +4,7 @@ import { X, Play, ExternalLink, AlertCircle, MonitorPlay } from 'lucide-react';
 import { VideoMetadata } from '../types';
 import { getEmbedUrl, canEmbed, formatDuration } from '../lib/utils';
 import { sanitizeUrl } from '../lib/security';
+import { useEscapeKey } from '../lib/useEscapeKey';
 
 const PROVIDER_LABELS: Record<string, string> = {
   youtube: 'YouTube',
@@ -52,6 +53,8 @@ export default function VideoPreviewModal({ metadata, onClose }: VideoPreviewMod
   const embedUrl = isTrustedEmbedOrigin(rawEmbedUrl) ? rawEmbedUrl : null;
   const safeSourceUrl = sanitizeUrl(metadata.url);
   const safeThumbnail = metadata.thumbnail ? sanitizeUrl(metadata.thumbnail) : null;
+
+  useEscapeKey(true, onClose);
 
   useEffect(() => {
     if (!supportsEmbed || !embedUrl || iframeLoaded) return;
@@ -168,7 +171,7 @@ export default function VideoPreviewModal({ metadata, onClose }: VideoPreviewMod
               <div className="relative w-full h-full flex flex-col items-center justify-center">
                 {/* Blurred thumbnail background */}
                 {safeThumbnail && (
-                  <img
+                  <img referrerPolicy="no-referrer"
                     src={safeThumbnail}
                     alt=""
                     className="absolute inset-0 w-full h-full object-cover opacity-25 blur-md scale-110"
@@ -179,7 +182,7 @@ export default function VideoPreviewModal({ metadata, onClose }: VideoPreviewMod
                 <div className="relative z-10 flex flex-col items-center gap-5 max-w-sm text-center px-6">
                   {safeThumbnail && (
                     <div className="size-32 rounded-[12px] overflow-hidden border border-white/15 shadow-2xl">
-                      <img src={safeThumbnail} alt={metadata.title} className="w-full h-full object-cover" />
+                      <img referrerPolicy="no-referrer" src={safeThumbnail} alt={metadata.title} className="w-full h-full object-cover" />
                     </div>
                   )}
 

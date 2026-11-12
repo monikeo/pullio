@@ -1,6 +1,7 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Github, Heart, Shield, Zap } from 'lucide-react';
+import { useEscapeKey } from '../lib/useEscapeKey';
 
 interface AboutModalProps {
   isOpen: boolean;
@@ -8,6 +9,7 @@ interface AboutModalProps {
 }
 
 export default function AboutModal({ isOpen, onClose }: AboutModalProps) {
+  useEscapeKey(isOpen, onClose);
   return (
     <AnimatePresence>
       {isOpen && (

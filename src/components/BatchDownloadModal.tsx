@@ -5,6 +5,7 @@ import { useAppStore } from '../store/useAppStore';
 import { ProviderType } from '../types';
 import { cn, detectMediaProvider } from '../lib/utils';
 import { expandBatchUrl } from '../lib/batch';
+import { useEscapeKey } from '../lib/useEscapeKey';
 
 interface BatchDownloadModalProps {
   isOpen: boolean;
@@ -24,6 +25,8 @@ export default function BatchDownloadModal({ isOpen, onClose, initialUrls = EMPT
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [queueProgress, setQueueProgress] = useState({ completed: 0, total: 0 });
+  // Escape closes the dialog, except while links are still being queued.
+  useEscapeKey(isOpen && !isSubmitting, onClose);
 
   // Reset the editor on every open, including when the new batch is empty.
   React.useEffect(() => {
@@ -104,7 +107,7 @@ export default function BatchDownloadModal({ isOpen, onClose, initialUrls = EMPT
                 type: isAudio ? 'audio' : 'video',
                 targetContainer: container,
                 maxConcurrentDownloads: preferences.maxConcurrentDownloads,
-                filenameTemplate: preferences.filenameTemplate,
+                filenameTemplate: preferences.filenameTemplate, embedMetadata: preferences.embedMetadata,
                 filenameQuality: String(targetItag),
               }),
             });

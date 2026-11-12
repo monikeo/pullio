@@ -2,6 +2,7 @@ import React from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useAppStore } from '../store/useAppStore';
 import { Zap, Share2, PlusSquare, CheckCircle2, X, Shield, WifiOff } from 'lucide-react';
+import { useEscapeKey } from '../lib/useEscapeKey';
 
 interface PwaInstallModalProps {
   isOpen: boolean;
@@ -10,6 +11,7 @@ interface PwaInstallModalProps {
 
 export default function PwaInstallModal({ isOpen, onClose }: PwaInstallModalProps) {
   const { pwaInstallPrompt, triggerInstall, isPwaInstalled } = useAppStore();
+  useEscapeKey(isOpen, onClose);
 
   const isIOS = typeof navigator !== 'undefined' && /iPad|iPhone|iPod/.test(navigator.userAgent);
 

@@ -4,9 +4,11 @@ import { motion, AnimatePresence } from 'motion/react';
 import { 
   Settings, Smartphone, CheckCircle2, Trash2, Heart, ExternalLink, Zap, 
   HelpCircle, ShieldCheck, KeyRound, Upload, Check, AlertCircle, Loader2,
-  ChevronDown, ChevronUp, FileText, Globe, RefreshCw
+  ChevronDown, ChevronUp, FileText, Globe, RefreshCw, X, Bell
 } from 'lucide-react';
 import PwaInstallModal from './PwaInstallModal';
+import EngineStatusCard from './EngineStatusCard';
+import { NotificationAccess, notificationAccess, requestNotificationAccess } from '../lib/notifications';
 
 interface CookieStatus {
   configured: boolean;
@@ -25,6 +27,14 @@ export default function SettingsPanel() {
   const [queueLimitMessage, setQueueLimitMessage] = useState<{ text: string; isError?: boolean } | null>(null);
   const [filenameTemplateInput, setFilenameTemplateInput] = useState(preferences.filenameTemplate);
   const [filenameTemplateMessage, setFilenameTemplateMessage] = useState<{ text: string; isError?: boolean } | null>(null);
+  const [notifyAccess, setNotifyAccess] = useState<NotificationAccess>(() => notificationAccess());
+  const [removingDomain, setRemovingDomain] = useState<string | null>(null);
+
+  const handleNotificationToggle = async (enabled: boolean) => {
+    updatePreferences({ notifyOnComplete: enabled });
+    if (enabled && notificationAccess() === 'default') setNotifyAccess(await requestNotificationAccess());
+    else setNotifyAccess(notificationAccess());
+  };
 
   useEffect(() => {
     setFilenameTemplateInput(preferences.filenameTemplate);
@@ -203,6 +213,21 @@ export default function SettingsPanel() {
     }
   };
 
+  const handleRemoveCookieDomain = async (domain: string) => {
+    setRemovingDomain(domain);
+    try {
+      const res = await fetch(`/api/cookies?domain=${encodeURIComponent(domain)}`, { method: 'DELETE', signal: AbortSignal.timeout(15_000) });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || typeof data.configured !== 'boolean') throw new Error(data?.error || 'Could not remove these cookies.');
+      setCookieStatus({ configured: data.configured, size: data.size || 0, domains: Array.isArray(data.domains) ? data.domains : [], updatedAt: data.updatedAt ?? null });
+      showCookieMessage({ text: `Removed cookies for ${domain}.` }, 3000);
+    } catch (err) {
+      showCookieMessage({ text: err instanceof Error ? err.message : 'Could not remove these cookies.', isError: true });
+    } finally {
+      setRemovingDomain(null);
+    }
+  };
+
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -268,6 +293,8 @@ export default function SettingsPanel() {
           </div>
         </div>
 
+        <EngineStatusCard />
+
         {/* ─── PLATFORM AUTHENTICATION & COOKIE MANAGER ─────────────────────── */}
         <div className="p-5 rounded-[12px] bg-white/5 border border-white/10 flex flex-col gap-4">
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
@@ -311,8 +338,18 @@ export default function SettingsPanel() {
             <div className="flex flex-wrap items-center gap-1.5 p-2.5 rounded-[8px] bg-black/40 border border-white/5 text-[11px] font-mono text-gray-300">
               <span className="text-gray-500 font-sans font-bold">Active Domains:</span>
               {cookieStatus.domains.map((dom) => (
-                <span key={dom} className="px-2 py-0.5 rounded bg-white/10 text-white font-bold">
+                <span key={dom} className="pl-2 pr-0.5 py-0.5 rounded bg-white/10 text-white font-bold inline-flex items-center gap-1">
                   {dom}
+                  <button
+                    type="button"
+                    onClick={() => void handleRemoveCookieDomain(dom)}
+                    disabled={removingDomain !== null}
+                    className="p-0.5 rounded hover:bg-red-500/30 text-gray-400 hover:text-red-200 cursor-pointer disabled:opacity-40"
+                    aria-label={`Remove cookies for ${dom}`}
+                    title={`Remove cookies for ${dom}`}
+                  >
+                    {removingDomain === dom ? <Loader2 className="size-3 animate-spin" /> : <X className="size-3" />}
+                  </button>
                 </span>
               ))}
               <span className="text-gray-500 ml-auto">
@@ -382,6 +419,13 @@ export default function SettingsPanel() {
                   <option value=".xiaohongshu.com">.xiaohongshu.com (XiaoHongShu 小红书)</option>
                   <option value=".youtube.com">.youtube.com (YouTube)</option>
                   <option value=".instagram.com">.instagram.com (Instagram)</option>
+                  <option value=".facebook.com">.facebook.com (Facebook)</option>
+                  <option value=".tiktok.com">.tiktok.com (TikTok)</option>
+                  <option value=".x.com">.x.com (X / Twitter)</option>
+                  <option value=".vimeo.com">.vimeo.com (Vimeo)</option>
+                  <option value=".reddit.com">.reddit.com (Reddit)</option>
+                  <option value=".pinterest.com">.pinterest.com (Pinterest)</option>
+                  <option value=".soundcloud.com">.soundcloud.com (SoundCloud)</option>
                 </select>
 
                 <input
@@ -480,8 +524,12 @@ export default function SettingsPanel() {
                 className="w-full mt-2 bg-black/60 border border-white/10 rounded-[8px] px-3 py-2 text-xs font-bold text-neutral-200 outline-none focus:border-[var(--accent)]"
               >
                 <option value="best">Best Available (Source Max)</option>
-                <option value="1080p">1080p Full HD</option>
-                <option value="720p">720p HD</option>
+                <option value="2160p">Up to 2160p 4K</option>
+                <option value="1440p">Up to 1440p 2K</option>
+                <option value="1080p">Up to 1080p Full HD</option>
+                <option value="720p">Up to 720p HD</option>
+                <option value="480p">Up to 480p · saves data</option>
+                <option value="360p">Up to 360p · smallest</option>
                 <option value="audio-320">MP3 · 320 kbps target</option>
                 <option value="audio-128">MP3 · 128 kbps target</option>
               </select>
@@ -540,6 +588,35 @@ export default function SettingsPanel() {
                 checked={preferences.autoAnalyzeOnPaste}
                 onChange={(e) => updatePreferences({ autoAnalyzeOnPaste: e.target.checked })}
                 className="size-4 accent-[var(--accent)] rounded cursor-pointer"
+              />
+            </label>
+            <label className="flex items-center justify-between gap-3 p-3.5 bg-white/5 border border-white/5 rounded-[10px] cursor-pointer">
+              <div>
+                <span className="text-xs font-bold text-white block">Embed Tags, Chapters &amp; Cover Art</span>
+                <span className="text-[11px] text-gray-400">Write title, artist, date, and chapters into files, plus cover art for MP3, M4A, MP4, and MKV</span>
+              </div>
+              <input
+                type="checkbox"
+                checked={preferences.embedMetadata}
+                onChange={(e) => updatePreferences({ embedMetadata: e.target.checked })}
+                className="size-4 accent-[var(--accent)] rounded cursor-pointer shrink-0"
+              />
+            </label>
+            <label className="flex items-center justify-between gap-3 p-3.5 bg-white/5 border border-white/5 rounded-[10px] cursor-pointer">
+              <div>
+                <span className="text-xs font-bold text-white flex items-center gap-1.5"><Bell className="size-3.5 text-[var(--accent)]" /> Notify When Finished</span>
+                <span className="text-[11px] text-gray-400">
+                  {notifyAccess === 'unsupported' ? 'This browser does not support notifications.'
+                    : notifyAccess === 'denied' ? 'Notifications are blocked. Allow them for this site in your browser settings.'
+                    : 'Show a system notification when a download or conversion finishes while Pullio is in the background'}
+                </span>
+              </div>
+              <input
+                type="checkbox"
+                checked={preferences.notifyOnComplete && notifyAccess !== 'denied' && notifyAccess !== 'unsupported'}
+                disabled={notifyAccess === 'denied' || notifyAccess === 'unsupported'}
+                onChange={(e) => void handleNotificationToggle(e.target.checked)}
+                className="size-4 accent-[var(--accent)] rounded cursor-pointer shrink-0 disabled:cursor-not-allowed disabled:opacity-40"
               />
             </label>
           </div>

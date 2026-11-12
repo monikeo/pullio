@@ -219,7 +219,7 @@ export default function DownloadProgress() {
                 {/* Background blurred cover */}
                 <div className="absolute inset-0 opacity-[0.03] pointer-events-none">
                   {job.thumbnail && (
-                    <img src={job.thumbnail} className="w-full h-full object-cover blur-md scale-110" alt="" />
+                    <img referrerPolicy="no-referrer" src={job.thumbnail} className="w-full h-full object-cover blur-md scale-110" alt="" />
                   )}
                 </div>
 
@@ -227,7 +227,7 @@ export default function DownloadProgress() {
                   {/* Miniature Thumbnail */}
                   {job.thumbnail && (
                     <div className="size-16 rounded-[8px] overflow-hidden bg-black/40 shrink-0 relative border border-white/10">
-                      <img src={job.thumbnail} className="w-full h-full object-cover opacity-80" alt="" />
+                      <img referrerPolicy="no-referrer" src={job.thumbnail} className="w-full h-full object-cover opacity-80" alt="" />
                       {isFailed ? (
                         <div className="absolute inset-0 bg-red-950/80 flex items-center justify-center text-red-400">
                           <AlertTriangle className="size-5" />

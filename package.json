@@ -1,19 +1,21 @@
 {
   "name": "pullio",
   "private": true,
-  "version": "0.0.0",
+  "version": "2.1.0",
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --define:process.env.NODE_ENV=\\\"production\\\" --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test:audio": "tsx --test tests/audio-enhancement.test.ts"
+    "test": "tsx --test tests/audio-enhancement.test.ts tests/server-hardening.test.ts",
+    "test:audio": "tsx --test tests/audio-enhancement.test.ts",
+    "test:server": "tsx --test tests/server-hardening.test.ts"
   },
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",

@@ -3,7 +3,7 @@ import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import http from "http";
-import { isIP } from "net";
+import os from "os";
 import { WebSocketServer, WebSocket } from "ws";
 import crypto from "crypto";
 import https from "https";
@@ -16,10 +16,21 @@ import { AudioEditSettings, resolveAudioEdit, validateAudioEdit } from './src/li
 import { readAudioWaveform } from './src/lib/audioWaveform.server';
 import { ZipFile } from 'yazl';
 import { DownloadRecord, downloadIdentity, isDemoMediaUrl, publicDownloadRecord } from './src/lib/downloads';
-import { DownloadJournal } from './src/lib/downloadJournal.server';
+import { DownloadJournal, StallWatchdog } from './src/lib/downloadJournal.server';
 import { runDownloadWorker } from './src/lib/downloadWorker.server';
+import { detectProviderFromUrl, providerFromExtractor } from './src/lib/providers';
+import { assertPublicMediaUrl, isValidMediaUrl, publicOnlyLookup } from './src/lib/netSafety.server';
+import { createApiRequestGuard, isAllowedUpgrade } from './src/lib/requestGuard.server';
+import { MediaEngine } from './src/lib/engine.server';
+import { downloadSubtitle, isValidSubtitleLanguage, selectSubtitleTracks } from './src/lib/subtitles.server';
+import { buildMediaFormatList } from './src/lib/mediaFormats.server';
+import { classifyMediaError } from './src/lib/mediaErrors.server';
+import { extractMediaUrlFromText, normalizeMediaUrl } from './src/lib/mediaUrls';
 
 const execFileAsync = promisify(execFile);
+const APP_VERSION = (() => {
+  try { return JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')).version || '0.0.0'; } catch { return '0.0.0'; }
+})();
 
 // Path to static ffmpeg binary directory
 const FFMPEG_DIR = ffmpegPath ? path.dirname(ffmpegPath) : "";
@@ -33,132 +44,38 @@ const YT_DLP_PATH = path.join(
   process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp"
 );
 
+const mediaEngine = new MediaEngine(YT_DLP_PATH, ffmpegPath || null);
+
 // Optional Netscape cookies file for content accessible to the account that owns the session.
-const COOKIES_FILE = path.join(process.cwd(), "cookies.txt");
-
-/** Normalizes platform-specific web share links (YouTube, Facebook, Instagram, Douyin, etc.) into canonical extractor URLs */
-function normalizeMediaUrl(rawUrl: string): string {
-  if (!rawUrl) return rawUrl;
-  let url = rawUrl.trim();
-
-  // YouTube: Normalize mobile links and shortlinks to canonical watch links
-  if (url.includes('youtu.be/')) {
-    const ytMatch = url.match(/youtu\.be\/([a-zA-Z0-9_-]+)/i);
-    if (ytMatch && ytMatch[1]) {
-      return `https://www.youtube.com/watch?v=${ytMatch[1]}`;
-    }
-  }
-  if (url.includes('m.youtube.com/watch')) {
-    url = url.replace('m.youtube.com', 'www.youtube.com');
-  }
-
-  // Facebook: Normalize mobile domains to www
-  if (url.includes('m.facebook.com') || url.includes('mobile.facebook.com') || url.includes('web.facebook.com')) {
-    url = url.replace(/\/\/(m|mobile|web)\.facebook\.com/i, '//www.facebook.com');
-  }
-
-  // Instagram: Normalize mobile domains and clean plural /reels/ to /reel/
-  if (url.includes('m.instagram.com')) {
-    url = url.replace('m.instagram.com', 'www.instagram.com');
-  }
-  if (url.includes('instagram.com/reels/')) {
-    url = url.replace('instagram.com/reels/', 'instagram.com/reel/');
-  }
-
-  // Douyin: Handle modal_id query param (e.g. /jingxuan?modal_id=123, /recommend?modal_id=123, /user/...?modal_id=123)
-  if (url.includes('douyin.com') || url.includes('iesdouyin.com')) {
-    const modalMatch = url.match(/[?&]modal_id=(\d+)/i);
-    if (modalMatch && modalMatch[1]) {
-      return `https://www.douyin.com/video/${modalMatch[1]}`;
-    }
-    const noteMatch = url.match(/\/note\/(\d+)/i);
-    if (noteMatch && noteMatch[1]) {
-      return `https://www.douyin.com/video/${noteMatch[1]}`;
-    }
-    const shareMatch = url.match(/iesdouyin\.com\/share\/video\/(\d+)/i);
-    if (shareMatch && shareMatch[1]) {
-      return `https://www.douyin.com/video/${shareMatch[1]}`;
-    }
-    const mobileVideoMatch = url.match(/douyin\.com\/share\/video\/(\d+)/i);
-    if (mobileVideoMatch && mobileVideoMatch[1]) {
-      return `https://www.douyin.com/video/${mobileVideoMatch[1]}`;
-    }
-  }
-
-  // Bilibili: bvid in query params or short links
-  if (url.includes('bilibili.com') && !url.includes('/video/')) {
-    const bvidMatch = url.match(/[?&]bvid=(BV[a-zA-Z0-9]+)/i);
-    if (bvidMatch && bvidMatch[1]) {
-      const part = url.match(/[?&]p=(\d+)/)?.[1];
-      return `https://www.bilibili.com/video/${bvidMatch[1]}${part ? `?p=${part}` : ''}`;
-    }
-  }
-
-  // Pinterest: Normalize pin IDs and clean trailing query noise
-  if (url.includes('pinterest.com/pin/')) {
-    const pinMatch = url.match(/pinterest\.com\/pin\/(\d+)/i);
-    if (pinMatch && pinMatch[1]) {
-      return `https://www.pinterest.com/pin/${pinMatch[1]}/`;
-    }
-  }
-
-  return url;
-}
-
-/** Remove aggressive tracking queries from media URLs */
-function cleanMediaTrackingParams(rawUrl: string): string {
-  try {
-    const parsed = new URL(rawUrl);
-    const trackingParams = [
-      'spm_id_from', 'vd_source', 'trackid', 'from_source', 'share_source',
-      'igsh', 'utm_source', 'utm_medium', 'utm_campaign', 'si', 'share_token',
-      'mid', 'sender_device', 'is_from_webapp', 'previous_page', 'app_code',
-      'enter_from', 'tab_name', 'extra_params', 'share_app_id', 'mibextid',
-      'ref', '_rdr', 'extid', 'sfnsn', 'paipv', 'rdid', 'feature', 'pp', 'img_index'
-    ];
-    for (const p of trackingParams) {
-      parsed.searchParams.delete(p);
-    }
-    return normalizeMediaUrl(parsed.toString());
-  } catch {
-    return normalizeMediaUrl(rawUrl);
-  }
-}
-
-/** Extracts valid HTTP(S) media URL out of arbitrary user clipboard text (mobile share text) */
-function extractMediaUrlFromText(input: string): string {
-  if (!input) return '';
-  const sanitized = input.replace(/\uff1b/g, ';');
-  const trimmed = sanitized.trim();
-  let candidate = trimmed;
-  const match = trimmed.match(/https?:\/\/[^\s\u4e00-\u9fa5\r\n\t]+/i);
-  if (match) {
-    candidate = match[0];
-  }
-  candidate = candidate.replace(/[)\]}>,.!?;:，。！？；\uff1b]+$/, '');
-  return cleanMediaTrackingParams(candidate);
-}
+const COOKIES_FILE = path.resolve(process.env.PULLIO_COOKIES_FILE || path.join(process.cwd(), "cookies.txt"));
 
 /** Resolve short links (fb.watch, v.douyin.com, xhslink.com, pin.it, b23.tv, vt.tiktok.com, etc.) by following HTTP redirects */
+function isShortMediaLink(value: string): boolean {
+  try {
+    const { hostname, pathname } = new URL(value);
+    const host = hostname.toLowerCase();
+    const shortHosts = ["fb.watch", "v.douyin.com", "xhslink.com", "pin.it", "b23.tv", "vt.tiktok.com", "vm.tiktok.com", "t.co", "bit.ly", "redd.it"];
+    if (shortHosts.some(domain => host === domain || host.endsWith(`.${domain}`))) return true;
+    // Share links on full domains also redirect to the canonical post.
+    if ((host === "facebook.com" || host.endsWith(".facebook.com")) && /^\/share\//i.test(pathname)) return true;
+    if ((host === "tiktok.com" || host.endsWith(".tiktok.com")) && /^\/t\//i.test(pathname)) return true;
+    if ((host === "reddit.com" || host.endsWith(".reddit.com")) && /\/s\//i.test(pathname)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 async function resolveShortMediaUrl(targetUrl: string): Promise<string> {
-  if (!targetUrl) return targetUrl;
+  if (!targetUrl || !isShortMediaLink(targetUrl)) return targetUrl;
   let currentUrl = targetUrl;
-  const shortLinkDomains = [
-    "fb.watch", "facebook.com", "v.douyin.com", "douyin.com", "xhslink.com",
-    "pin.it", "b23.tv", "tiktok.com", "t.co", "bit.ly",
-  ];
 
   try {
-    const initial = new URL(targetUrl);
-    const initialHost = initial.hostname.toLowerCase();
-    const isShortlink = shortLinkDomains.some(domain => initialHost === domain || initialHost.endsWith(`.${domain}`));
-    if (!isShortlink) return targetUrl;
-
     // Resolve one redirect at a time so every destination is checked before
-    // the server makes a request to it.
+    // the server makes a request to it, and stop at the first non-short-link host.
     for (let redirectCount = 0; redirectCount < 6; redirectCount++) {
-      const urlCheck = isValidMediaUrl(currentUrl);
-      if (!urlCheck.valid) throw new Error(urlCheck.error || "Invalid short-link destination");
+      if (redirectCount > 0 && !isShortMediaLink(currentUrl)) return currentUrl;
+      await assertPublicMediaUrl(currentUrl);
 
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 6000);
@@ -195,46 +112,24 @@ async function resolveShortMediaUrl(targetUrl: string): Promise<string> {
   }
 }
 
-/** Validate media URL for safety and SSRF prevention */
-function isValidMediaUrl(inputUrl: string): { valid: boolean; error?: string } {
-  if (typeof inputUrl !== 'string' || inputUrl.length > 8000) return { valid: false, error: 'Enter a media URL of up to 8,000 characters.' };
+/**
+ * Turn user input (possibly mobile share text) into a validated, normalized media URL.
+ * Short links are resolved hop by hop and the final host is DNS-checked so that a public
+ * name pointing at a private address cannot make the server fetch internal resources.
+ */
+async function prepareMediaUrl(rawInput: unknown): Promise<{ url: string; demo: boolean }> {
+  if (typeof rawInput !== 'string' || !rawInput.trim()) throw Object.assign(new Error('URL is required'), { status: 400 });
+  let url = extractMediaUrlFromText(rawInput);
+  if (isDemoUrl(url)) return { url, demo: true };
+  const initial = isValidMediaUrl(url);
+  if (!initial.valid) throw Object.assign(new Error(initial.error), { status: 400 });
+  url = normalizeMediaUrl(await resolveShortMediaUrl(url));
   try {
-    const parsed = new URL(inputUrl);
-    if (!['http:', 'https:'].includes(parsed.protocol)) {
-      return { valid: false, error: 'Only HTTP and HTTPS protocols are supported.' };
-    }
-    const hostname = parsed.hostname.toLowerCase();
-    const address = hostname.replace(/^\[|\]$/g, "");
-    const ipVersion = isIP(address);
-    const ipv4Parts = ipVersion === 4 ? address.split(".").map(Number) : [];
-    const isPrivateIpv4 = ipVersion === 4 && (
-      ipv4Parts[0] === 0 || ipv4Parts[0] === 10 || ipv4Parts[0] === 127 ||
-      (ipv4Parts[0] === 169 && ipv4Parts[1] === 254) ||
-      (ipv4Parts[0] === 172 && ipv4Parts[1] >= 16 && ipv4Parts[1] <= 31) ||
-      (ipv4Parts[0] === 192 && ipv4Parts[1] === 168) ||
-      (ipv4Parts[0] === 100 && ipv4Parts[1] >= 64 && ipv4Parts[1] <= 127) ||
-      (ipv4Parts[0] >= 224)
-    );
-    const normalizedIpv6 = address.toLowerCase().split("%", 1)[0];
-    const isPrivateIpv6 = ipVersion === 6 && (
-      normalizedIpv6 === "::" || normalizedIpv6 === "::1" ||
-      normalizedIpv6.startsWith("::ffff:") || normalizedIpv6.startsWith("fc") ||
-      normalizedIpv6.startsWith("fd") || /^fe[89ab]/.test(normalizedIpv6) || normalizedIpv6.startsWith("ff")
-    );
-    if (
-      hostname === 'localhost' ||
-      hostname.endsWith('.localhost') ||
-      hostname.endsWith('.local') ||
-      hostname.endsWith('.internal') ||
-      isPrivateIpv4 ||
-      isPrivateIpv6
-    ) {
-      return { valid: false, error: 'Access to private or local network hosts is restricted.' };
-    }
-    return { valid: true };
-  } catch {
-    return { valid: false, error: 'Invalid URL format.' };
+    await assertPublicMediaUrl(url);
+  } catch (error) {
+    throw Object.assign(error instanceof Error ? error : new Error(String(error)), { status: 400 });
   }
+  return { url, demo: false };
 }
 
 // Structured logger with timestamps and levels (debug-log skill)
@@ -258,214 +153,6 @@ const log = {
     }
   }
 };
-
-export interface ClassifiedError {
-  category: 'BOT_CHECK' | 'RATE_LIMIT' | 'AUTH_REQUIRED' | 'PRIVATE_VIDEO' | 'GEO_BLOCKED' | 'FORMAT_UNAVAILABLE' | 'NOT_FOUND' | 'TIMEOUT' | 'UNKNOWN';
-  message: string;
-  retryable: boolean;
-  suggestedFallback?: string;
-}
-
-/** Categorize yt-dlp stderr output into user-friendly diagnostic messages (debug-error skill) */
-export function classifyMediaError(rawError: string | Error | any, provider = 'generic'): ClassifiedError {
-  const combined = `${rawError?.stderr || ''} ${rawError?.message || ''} ${String(rawError || '')}`;
-  const str = combined.toLowerCase();
-
-  if ((provider === 'bilibili' || str.includes('bilibili')) && (str.includes('412') || str.includes('precondition failed'))) {
-    return {
-      category: 'AUTH_REQUIRED',
-      message: 'Bilibili returned HTTP 412 (a precondition or security check). Confirm the video opens in your browser; if it is account-restricted, configure your own valid Bilibili session cookies. This app cannot bypass platform challenges.',
-      retryable: false
-    };
-  }
-
-  if (
-    (provider === 'douyin' || str.includes('douyin') || str.includes('iesdouyin')) &&
-    (str.includes('verify') || str.includes('验证') || str.includes('验证码') || str.includes('captcha') ||
-      str.includes('slide') || str.includes('risk control') || str.includes('风险') || str.includes('ttwid') ||
-      str.includes('s_v_web_id') || str.includes('fresh cookies') || str.includes('403') || str.includes('412'))
-  ) {
-    return {
-      category: 'BOT_CHECK',
-      message: 'Douyin returned a security or verification challenge. Complete checks through Douyin’s official site or app; this downloader cannot bypass them. Your own valid session may help only with content your account is allowed to access.',
-      retryable: false
-    };
-  }
-
-  if (str.includes('429') || str.includes('too many requests') || str.includes('rate-limit')) {
-    return {
-      category: 'RATE_LIMIT',
-      message: `${provider.toUpperCase()} rate limit reached (HTTP 429). Please pause briefly before queueing more transfers.`,
-      retryable: false
-    };
-  }
-
-  if ((provider === 'bilibili' || str.includes('bilibili')) && str.includes('403')) {
-    return {
-      category: 'AUTH_REQUIRED',
-      message: 'Bilibili denied access (HTTP 403). Check that the video opens for your account; if it is account-restricted, configure your own valid Bilibili session cookies. This app cannot bypass platform challenges.',
-      retryable: false
-    };
-  }
-
-  if (str.includes('403') || str.includes('forbidden')) {
-    return {
-      category: 'AUTH_REQUIRED',
-      message: 'The platform denied access (HTTP 403). Check that the link opens for your account and that the post is public or otherwise authorized.',
-      retryable: false
-    };
-  }
-
-  if (str.includes('412') || str.includes('precondition failed')) {
-    return {
-      category: 'AUTH_REQUIRED',
-      message: 'The platform returned HTTP 412 (a precondition or security check). Confirm the link opens in your browser and retry only if the platform permits access. This app cannot bypass platform challenges.',
-      retryable: false
-    };
-  }
-
-  if (str.includes('sign in to confirm') || str.includes('not a bot') || str.includes('po token') || str.includes('captcha')) {
-    return {
-      category: 'BOT_CHECK',
-      message: `${provider.toUpperCase()} requires a platform verification or challenged this request. Complete checks through the official site; this app cannot bypass them. Retry only if you are authorized and the platform permits downloading.`,
-      retryable: false
-    };
-  }
-
-  // Instagram anti-scraping / session verification check
-  if (
-    (str.includes('instagram') || provider === 'instagram') &&
-    (str.includes('empty media response') || str.includes('not granting access') || str.includes('checkpoint_required') || str.includes('login_required') || str.includes('cookies for the authentication'))
-  ) {
-    return {
-      category: 'AUTH_REQUIRED',
-      message: 'Instagram anti-crawler protection: Instagram requires session cookies for access. Please add your Instagram session cookies (sessionid) in Settings to download.',
-      retryable: false
-    };
-  }
-
-  // Facebook anti-scraping / login check
-  if (
-    (str.includes('facebook') || provider === 'facebook') &&
-    (str.includes('login') || str.includes('checkpoint') || str.includes('private') || str.includes('friends-only') || str.includes('log in to continue'))
-  ) {
-    return {
-      category: 'AUTH_REQUIRED',
-      message: 'Facebook privacy restriction: This video is private/friends-only or requires authentication. Please check post visibility or add Facebook cookies in Settings.',
-      retryable: false
-    };
-  }
-
-  // Non-ASCII / Latin-1 encoding errors (e.g. Chinese full-width semicolons in cookies or headers)
-  if (
-    str.includes('unicodeencodeerror') ||
-    str.includes('latin-1') ||
-    str.includes('ordinal not in range') ||
-    str.includes('\uff1b') ||
-    str.includes('\\uff1b')
-  ) {
-    return {
-      category: 'AUTH_REQUIRED',
-      message: 'Invalid cookie or header character encoding: Full-width Chinese punctuation (；) or non-ASCII characters detected. Pullio has auto-sanitized the cookies — please retry.',
-      retryable: true
-    };
-  }
-
-  // XiaoHongShu (小红书) image note vs video note classification
-  if (
-    (str.includes('xiaohongshu') || str.includes('xhs') || provider === 'xiaohongshu') &&
-    (str.includes('no video') || str.includes('extract_note') || str.includes('not a video') || str.includes('extractorerror'))
-  ) {
-    return {
-      category: 'FORMAT_UNAVAILABLE',
-      message: 'This XiaoHongShu note (小红书笔记) appears to be an image gallery (图文笔记) or requires login cookies to access. Only video notes can be extracted as video.',
-      retryable: false
-    };
-  }
-
-  // Vimeo password protected or domain restricted
-  if (
-    (str.includes('vimeo') || provider === 'vimeo') &&
-    (str.includes('password') || str.includes('private') || str.includes('403') || str.includes('forbidden'))
-  ) {
-    return {
-      category: 'PRIVATE_VIDEO',
-      message: 'This Vimeo video is password protected, private, or domain-restricted by its creator.',
-      retryable: false
-    };
-  }
-
-  // Pinterest static pin
-  if (
-    (str.includes('pinterest') || provider === 'pinterest') &&
-    (str.includes('no video') || str.includes('format not available'))
-  ) {
-    return {
-      category: 'FORMAT_UNAVAILABLE',
-      message: 'This Pinterest pin is a static image or GIF without an MP4 video stream.',
-      retryable: false
-    };
-  }
-
-  if (str.includes('private video') || str.includes('this video is private') || str.includes('members-only')) {
-    return {
-      category: 'PRIVATE_VIDEO',
-      message: 'This video is private, members-only, or restricted by the creator.',
-      retryable: false
-    };
-  }
-
-  if (str.includes('not available in your country') || str.includes('geo-restricted') || str.includes('geo blocked')) {
-    return {
-      category: 'GEO_BLOCKED',
-      message: 'This media is geo-restricted and not licensed for streaming in this region.',
-      retryable: false
-    };
-  }
-
-  if (str.includes('requested format is not available') || str.includes('format not available')) {
-    return {
-      category: 'FORMAT_UNAVAILABLE',
-      message: 'The requested resolution stream was not provided by the host. Auto-retrying with best standard stream...',
-      retryable: true,
-      suggestedFallback: 'best'
-    };
-  }
-
-  if (
-    str.includes('video is unavailable') ||
-    str.includes('video unavailable') ||
-    str.includes('this video is unavailable') ||
-    str.includes('does not exist') ||
-    str.includes('not found') ||
-    str.includes('404')
-  ) {
-    return {
-      category: 'NOT_FOUND',
-      message: 'Media not found. The video or playlist may have been deleted, set to private, or the URL is invalid.',
-      retryable: false
-    };
-  }
-
-  if (str.includes('timed out') || str.includes('timeout') || str.includes('socket hang up') || str.includes('econnreset')) {
-    return {
-      category: 'TIMEOUT',
-      message: 'Connection timed out while extracting media streams. Retrying usually succeeds.',
-      retryable: true
-    };
-  }
-
-  let cleanMsg = rawError?.stderr || rawError?.message || String(rawError || '');
-  cleanMsg = cleanMsg.replace(/^Command failed:.*?yt-dlp(\.exe)?\s+/is, '');
-  const lines = cleanMsg.split(/[\r\n]+/).map((l: string) => l.trim()).filter((l: string) => l.length > 0);
-  const errorLine = lines.find((l: string) => l.startsWith('ERROR:')) || lines[0] || 'Failed to process media request.';
-
-  return {
-    category: 'UNKNOWN',
-    message: errorLine.replace(/^ERROR:\s*/i, ''),
-    retryable: false
-  };
-}
 
 /** Strips non-ASCII / non-latin1 characters and converts Chinese full-width punctuation to standard ASCII */
 function sanitizeCookieContent(raw: string): string {
@@ -572,32 +259,67 @@ function parseRawCookieStringToNetscape(cookieStr: string, defaultDomain = ".bil
   return lines.join("\n") + "\n";
 }
 
+const COOKIE_FILE_HEADER = "# Netscape HTTP Cookie File\n# Managed by Pullio. Treat this file like a password.\n";
+const COOKIE_DOMAIN_PATTERN = /^\.?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
+
+/** Domain of a Netscape cookie line (HttpOnly cookies are written as `#HttpOnly_<domain>`), or null for comments. */
+function cookieLineDomain(line: string): string | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  const body = trimmed.startsWith("#HttpOnly_") ? trimmed.slice("#HttpOnly_".length) : trimmed;
+  if (body.startsWith("#")) return null;
+  const parts = body.split("\t");
+  if (parts.length < 7 || !parts[0]) return null;
+  return parts[0].replace(/^\./, "").toLowerCase();
+}
+
+function cookieLines(content: string): string[] {
+  return content.split(/\r?\n/).map(line => line.trim()).filter(line => cookieLineDomain(line) !== null);
+}
+
+/** Merge new cookies into the existing file, replacing only the domains present in the new content. */
+function mergeCookieContent(existing: string, incoming: string): string {
+  const incomingLines = cookieLines(incoming);
+  const replacedDomains = new Set(incomingLines.map(line => cookieLineDomain(line)!));
+  const kept = cookieLines(existing).filter(line => !replacedDomains.has(cookieLineDomain(line)!));
+  return COOKIE_FILE_HEADER + [...kept, ...incomingLines].join("\n") + "\n";
+}
+
+/** Remove every cookie for a site (the domain and its subdomains). Returns the number removed. */
+function removeCookieDomain(domain: string): number {
+  if (!fs.existsSync(COOKIES_FILE)) return 0;
+  const target = domain.replace(/^\./, "").toLowerCase();
+  const lines = cookieLines(fs.readFileSync(COOKIES_FILE, "utf-8"));
+  const kept = lines.filter(line => { const d = cookieLineDomain(line)!; return d !== target && !d.endsWith(`.${target}`); });
+  if (!kept.length) fs.unlinkSync(COOKIES_FILE);
+  else writeCookiesFile(COOKIE_FILE_HEADER + kept.join("\n") + "\n");
+  return lines.length - kept.length;
+}
+
+function writeCookiesFile(content: string) {
+  const temporary = `${COOKIES_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, content, { encoding: "utf-8", mode: 0o600 });
+  fs.renameSync(temporary, COOKIES_FILE);
+}
+
 /** Return status and summary of active cookies.txt configuration */
 function getCookiesSummary() {
   if (!fs.existsSync(COOKIES_FILE)) {
-    return { configured: false, size: 0, domains: [] as string[], updatedAt: null as number | null };
+    return { configured: false, size: 0, domains: [] as string[], cookieCount: 0, updatedAt: null as number | null };
   }
   try {
     const stats = fs.statSync(COOKIES_FILE);
-    const content = fs.readFileSync(COOKIES_FILE, "utf-8");
-    const domainSet = new Set<string>();
-    const lines = content.split(/[\r\n]+/);
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith("#") || !trimmed) continue;
-      const parts = trimmed.split("\t");
-      if (parts.length >= 1 && parts[0]) {
-        domainSet.add(parts[0].replace(/^\./, ""));
-      }
-    }
+    const lines = cookieLines(fs.readFileSync(COOKIES_FILE, "utf-8"));
+    const domainSet = new Set<string>(lines.map(line => cookieLineDomain(line)!));
     return {
-      configured: true,
+      configured: lines.length > 0,
       size: stats.size,
       updatedAt: stats.mtimeMs,
-      domains: Array.from(domainSet),
+      cookieCount: lines.length,
+      domains: Array.from(domainSet).sort(),
     };
   } catch {
-    return { configured: false, size: 0, domains: [] as string[], updatedAt: null as number | null };
+    return { configured: false, size: 0, domains: [] as string[], cookieCount: 0, updatedAt: null as number | null };
   }
 }
 
@@ -622,6 +344,7 @@ function getYtDlpRuntimeArgs(): string[] {
 
 /** Fetch video metadata and formats, retrying network failures over IPv4 once. */
 async function getYtDlpInfo(url: string, retry = 0): Promise<any> {
+  await mediaEngine.waitForIdle();
   const args = [
     "--dump-json",
     "--no-playlist",
@@ -732,114 +455,6 @@ function getYtDlpFormatArg(itag: string | number, type: 'video' | 'audio'): stri
   return 'bestvideo+bestaudio/best';
 }
 
-/** Return the actual downloadable stream choices exposed by yt-dlp. */
-function buildMediaFormatList(info: any) {
-  const videoFormats: any[] = [];
-  const videoOnlyFormats: any[] = [];
-  const audioFormats: any[] = [];
-  const rawFormats = (Array.isArray(info.formats) ? info.formats : [])
-    .filter((f: any) => {
-      const formatId = String(f.format_id || "");
-      return f.ext !== "mhtml" && f.protocol !== "mhtml" && f.format_note !== "storyboard" &&
-        ((f.vcodec && f.vcodec !== "none") || (f.acodec && f.acodec !== "none")) &&
-        /^[A-Za-z0-9_.-]{1,128}$/.test(formatId);
-    })
-    .sort((a: any, b: any) => {
-      const aResolution = Math.max(a.height || 0, a.width || 0);
-      const bResolution = Math.max(b.height || 0, b.width || 0);
-      if (bResolution !== aResolution) return bResolution - aResolution;
-      if ((b.fps || 0) !== (a.fps || 0)) return (b.fps || 0) - (a.fps || 0);
-      return (b.tbr || b.vbr || b.abr || 0) - (a.tbr || a.vbr || a.abr || 0);
-    });
-
-  for (const f of rawFormats) {
-    const formatId = String(f.format_id);
-    const hasVideo = Boolean(f.vcodec && f.vcodec !== "none" && f.video_ext !== "none");
-    const hasAudio = Boolean(f.acodec && f.acodec !== "none" && f.audio_ext !== "none");
-    const width = Number(f.width || 0) || undefined;
-    const height = Number(f.height || 0) || undefined;
-    const resRank = width && height ? Math.min(width, height) : Math.max(width || 0, height || 0);
-    const dimensions = width && height ? `${width}×${height}` : f.resolution || "";
-    const effectiveResolution = resRank ? `${resRank}p` : (f.format_note || "Video");
-    const fps = Number(f.fps || 0) || undefined;
-    const codec = String(f.vcodec || "").split(".")[0];
-    const ext = String(f.ext || "").toUpperCase();
-    const fpsLabel = fps ? ` · ${fps} fps` : "";
-    const dimensionsLabel = dimensions ? ` · ${dimensions}` : "";
-    const codecLabel = codec && codec !== "none" ? ` · ${codec}` : "";
-    const extLabel = ext ? ` · ${ext}` : "";
-    const filesize = f.filesize || f.filesize_approx;
-
-    if (hasVideo) {
-      const quality = `${effectiveResolution}${dimensionsLabel}${fpsLabel}${codecLabel}${extLabel}`;
-      videoFormats.push({
-        itag: hasAudio ? `yt:video:${formatId}` : `yt:merge:${formatId}`,
-        quality: hasAudio ? `${quality} · audio included` : `${quality} · merge best audio`,
-        type: "video",
-        fps,
-        width,
-        height,
-        vcodec: f.vcodec,
-        acodec: f.acodec,
-        bitrate: Number(f.tbr || f.vbr || 0) || undefined,
-        filesize,
-        ext: f.ext,
-        resRank,
-      });
-
-      if (!hasAudio) {
-        videoOnlyFormats.push({
-          itag: `yt:raw:${formatId}`,
-          quality: `${quality} · video only`,
-          type: "video-only",
-          fps,
-          width,
-          height,
-          vcodec: f.vcodec,
-          bitrate: Number(f.tbr || f.vbr || 0) || undefined,
-          filesize,
-          ext: f.ext,
-          resRank,
-        });
-      }
-    } else if (hasAudio) {
-      const abr = Number(f.abr || 0);
-      const audioCodec = String(f.acodec || "Audio").split(".")[0];
-      audioFormats.push({
-        itag: `yt:audio-source:${formatId}`,
-        quality: `${abr ? `${Math.round(abr)} kbps · ` : ""}${audioCodec}${extLabel} · original audio`,
-        type: "audio",
-        acodec: f.acodec,
-        bitrate: Number(f.abr || f.tbr || 0) || undefined,
-        filesize,
-        ext: f.ext,
-        sourceExt: f.ext,
-        resRank: abr,
-      });
-    }
-  }
-
-  // Keep explicit MP3 encoder targets for playlist and legacy UI controls.
-  const mp3Targets = [
-    { itag: "audio-320", quality: "MP3 · 320 kbps target", type: "audio", ext: "mp3" },
-    { itag: "audio-256", quality: "MP3 · 256 kbps target", type: "audio", ext: "mp3" },
-    { itag: "audio-128", quality: "MP3 · 128 kbps target", type: "audio", ext: "mp3" },
-  ];
-
-  if (videoFormats.length === 0) {
-    videoFormats.push({ itag: "best", quality: "Best available video and audio", type: "video", resRank: 0 });
-  }
-  if (audioFormats.length === 0) {
-    audioFormats.push({ itag: "audio", quality: "Best available audio · MP3 output", type: "audio", ext: "mp3" });
-  }
-
-  videoFormats.sort((a, b) => (b.resRank || 0) - (a.resRank || 0) || (b.fps || 0) - (a.fps || 0) || (b.bitrate || 0) - (a.bitrate || 0));
-  videoOnlyFormats.sort((a, b) => (b.resRank || 0) - (a.resRank || 0) || (b.fps || 0) - (a.fps || 0) || (b.bitrate || 0) - (a.bitrate || 0));
-  audioFormats.sort((a, b) => (b.resRank || 0) - (a.resRank || 0));
-
-  return [...videoFormats, ...videoOnlyFormats, ...audioFormats, ...mp3Targets];
-}
-
 /** Check if a given URL is a playlist, album, collection, or showcase */
 function isPlaylistUrl(url: string, provider: string): boolean {
   const lower = url.toLowerCase();
@@ -862,6 +477,7 @@ async function getYtDlpPlaylistInfo(url: string, retry = 0): Promise<any> {
   const listMatch = url.match(/[?&]list=([^&#]+)/);
   const isYouTube = url.includes("youtube.com") || url.includes("youtu.be");
   const targetUrl = (listMatch && isYouTube) ? `https://www.youtube.com/playlist?list=${listMatch[1]}` : url;
+  await mediaEngine.waitForIdle();
 
   const args = [
     "--dump-single-json",
@@ -1145,7 +761,6 @@ const studioWaveforms = new WeakMap<ConversionJob, ReturnType<typeof readAudioWa
 const uploadedFiles = new Map<string, { path: string; originalName: string; size: number }>();
 const activeConversionProcesses = new Map<string, any>();
 const lastConvertBroadcastTime = new Map<string, number>();
-let globalWss: WebSocketServer | null = null;
 
 function broadcastConvertUpdate(jobId: string, force = false) {
   const job = conversionJobs.get(jobId);
@@ -1158,14 +773,8 @@ function broadcastConvertUpdate(jobId: string, force = false) {
   }
   lastConvertBroadcastTime.set(jobId, now);
 
-  const payload = JSON.stringify({
-    type: "convert-progress",
-    job: {
-      ...job,
-      downloadUrl: `/api/convert/download/${job.jobId}`,
-    },
-  });
-
+  // Only clients that subscribed to this job receive it, and server file paths are never sent.
+  const payload = JSON.stringify({ type: "convert-progress", job: publicConversionJob(job) });
   const subscribers = wsSubscriptions.get(jobId);
   if (subscribers) {
     subscribers.forEach((ws) => {
@@ -1174,14 +783,11 @@ function broadcastConvertUpdate(jobId: string, force = false) {
       }
     });
   }
+}
 
-  if (globalWss) {
-    globalWss.clients.forEach((client: any) => {
-      if (client.readyState === WebSocket.OPEN) {
-        try { client.send(payload); } catch {}
-      }
-    });
-  }
+function publicConversionJob(job: ConversionJob) {
+  const { inputPath, outputPath, ...rest } = job;
+  return { ...rest, downloadUrl: `/api/convert/download/${job.jobId}` };
 }
 
 function getMediaDuration(filePath: string): Promise<number> {
@@ -1210,6 +816,7 @@ function formatBytes(bytes: number): string {
 }
 
 const MAX_CONCURRENT_CONVERSIONS = 2;
+const CONVERSION_STALL_MS = 5 * 60_000;
 let activeConversionsCount = 0;
 const pendingConversionQueue: string[] = [];
 const pendingConversionJobIds = new Set<string>();
@@ -1332,8 +939,14 @@ async function processConversionJob(jobId: string) {
     args.push(outputPath);
 
     log.info("CONVERT", `Starting conversion job ${jobId} -> ${targetExt}`);
-    const child = spawn(ffmpegPath || "ffmpeg", args, { timeout: 15 * 60 * 1000 });
+    const child = spawn(ffmpegPath || "ffmpeg", args, { windowsHide: true });
     activeConversionProcesses.set(jobId, child);
+    // Long conversions are allowed as long as FFmpeg keeps reporting progress; a stuck process is stopped.
+    let stalled = false;
+    const watchdog = new StallWatchdog(() => CONVERSION_STALL_MS, () => {
+      stalled = true;
+      try { child.kill("SIGKILL"); } catch {}
+    }, 5000);
 
     let stderrData = "";
     await new Promise<void>((resolve) => {
@@ -1341,10 +954,12 @@ async function processConversionJob(jobId: string) {
       const finish = () => {
         if (settled) return;
         settled = true;
+        watchdog.stop();
         resolve();
       };
 
       child.stderr.on("data", (chunk) => {
+      watchdog.activity();
       const line = chunk.toString();
       stderrData = (stderrData + line).slice(-32_000);
 
@@ -1399,7 +1014,9 @@ async function processConversionJob(jobId: string) {
           log.info("CONVERT", `Conversion job ${jobId} completed successfully! Size: ${job.outputFileSize}`);
         } else {
           job.status = "failed";
-          job.error = /matches no streams|does not contain any stream/i.test(stderrData)
+          job.error = stalled
+            ? 'Conversion stopped because FFmpeg made no progress for several minutes. Retry the file.'
+            : /matches no streams|does not contain any stream/i.test(stderrData)
             ? 'This source does not contain a decodable audio track.'
             : job.studioPurpose ? 'Audio processing failed. Check that the source has a supported audio track and try again.'
             : `FFmpeg conversion failed (code ${code}). ${stderrData.slice(-120)}`;
@@ -1511,6 +1128,7 @@ async function recoverDownloadQueue() {
       provider: text(raw.provider, 'generic', 30), title: text(raw.title, 'Recovered download'), thumbnail: text(raw.thumbnail, '', 2000),
       targetContainer: ['mp4', 'mkv', 'webm', 'mp3', 'm4a'].includes(raw.targetContainer) ? raw.targetContainer : raw.type === 'audio' ? 'mp3' : 'mkv',
       filenameTemplate: validateFilenameTemplate(raw.filenameTemplate) || DEFAULT_FILENAME_TEMPLATE, filenameQuality: text(raw.filenameQuality, '', 32),
+      embedMetadata: raw.embedMetadata !== false,
       progress: Math.max(0, Math.min(100, Number(raw.progress) || 0)), speed: status === 'paused' ? 'Paused' : '0 MB/s', eta: status === 'queued' ? 'Recovering queue…' : '--:--',
       fileSize: text(raw.fileSize, 'Unknown', 32), bytesDownloaded: text(raw.bytesDownloaded, '0 MB', 32), downloadedBytes: Number.isFinite(raw.downloadedBytes) ? Math.max(0, raw.downloadedBytes) : 0,
       createdAt: Number.isFinite(raw.createdAt) ? raw.createdAt : Date.now(), updatedAt: Number.isFinite(raw.updatedAt) ? raw.updatedAt : Date.now(),
@@ -1640,10 +1258,16 @@ async function startServer() {
   const server = http.createServer(app);
 
   // Initialize WebSocket Server
-  const wss = new WebSocketServer({ noServer: true });
-  globalWss = wss;
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+  const guardOptions = { bindHost: HOST, allowedHosts: process.env.PULLIO_ALLOWED_HOSTS };
 
   server.on("upgrade", (request, socket, head) => {
+    // Vite's own HMR socket uses a separate port; every upgrade here is the progress channel.
+    if (!isAllowedUpgrade(request, guardOptions)) {
+      socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit("connection", ws, request);
     });
@@ -1678,8 +1302,9 @@ async function startServer() {
     ws.on("message", (messageStr) => {
       try {
         const data = JSON.parse(messageStr.toString());
-        if ((data.type === "subscribe" || data.type === "subscribe-convert") && data.jobId) {
+        if ((data.type === "subscribe" || data.type === "subscribe-convert") && isValidJobId(data.jobId)) {
           const jobId = data.jobId;
+          if (!subscribedJobs.has(jobId) && subscribedJobs.size >= 2000) return;
           subscribedJobs.add(jobId);
 
           if (!wsSubscriptions.has(jobId)) {
@@ -1699,18 +1324,12 @@ async function startServer() {
           const convJob = conversionJobs.get(jobId);
           if (convJob && ws.readyState === WebSocket.OPEN) {
             try {
-              ws.send(JSON.stringify({
-                type: "convert-progress",
-                job: {
-                  ...convJob,
-                  downloadUrl: `/api/convert/download/${convJob.jobId}`,
-                }
-              }));
+              ws.send(JSON.stringify({ type: "convert-progress", job: publicConversionJob(convJob) }));
             } catch {}
           }
         }
       } catch (err) {
-        log.error("WS", "Failed to parse incoming WS message", err);
+        log.debug("WS", "Ignored malformed WS message", (err as Error)?.message);
       }
     });
 
@@ -1732,6 +1351,7 @@ async function startServer() {
   app.use((_req, res, next) => {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "SAMEORIGIN");
+    res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
     res.setHeader("Cross-Origin-Opener-Policy", "same-origin-allow-popups");
     res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
@@ -1765,7 +1385,9 @@ async function startServer() {
     res.sendFile(path.join(process.cwd(), "public", "sw.js"));
   });
 
-  app.use(express.json());
+  // Block DNS-rebinding hosts and cross-site requests from other websites open in the browser.
+  app.use("/api", createApiRequestGuard(guardOptions));
+  app.use(express.json({ limit: "2mb" }));
   const archiveTickets = new Map<string, { ids: string[]; expires: number }>();
   let activeArchives = 0;
 
@@ -1883,69 +1505,98 @@ async function startServer() {
   });
 
   // API Routes
-  app.get("/api/health", (req, res) => {
+  app.get("/api/health", (_req, res) => {
+    // Kept cheap for load balancers and uptime checks: no child processes are awaited here.
+    const ytDlp = fs.existsSync(YT_DLP_PATH);
+    const ffmpeg = Boolean(ffmpegPath && fs.existsSync(ffmpegPath));
+    res.setHeader('Cache-Control', 'no-store');
     res.json({
-      status: "ok",
+      status: ytDlp && ffmpeg ? "ok" : "degraded",
       timestamp: Date.now(),
       uptime: process.uptime(),
-      ffmpeg: Boolean(ffmpegPath),
-      ytDlp: fs.existsSync(YT_DLP_PATH),
-      version: "2.0.0"
+      ffmpeg,
+      ytDlp,
+      version: APP_VERSION,
+      queue: { active: activeDownloadsCount, waiting: pendingDownloadQueue.length, limit: maxConcurrentDownloads, conversions: activeConversionsCount },
     });
+  });
+
+  // Engine status: versions of the bundled yt-dlp/FFmpeg, free disk space, and update state.
+  app.get("/api/engine", async (_req, res) => {
+    const engine = await mediaEngine.status();
+    let disk: { freeBytes: number; totalBytes: number } | null = null;
+    try {
+      const stats = await fs.promises.statfs(STORAGE_ROOT);
+      disk = { freeBytes: stats.bavail * stats.bsize, totalBytes: stats.blocks * stats.bsize };
+    } catch {}
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      ...engine,
+      ytDlp: { available: engine.ytDlp.available, version: engine.ytDlp.version, ageDays: MediaEngine.versionAgeDays(engine.ytDlp.version) },
+      app: APP_VERSION,
+      platform: `${os.platform()} ${os.arch()}`,
+      disk,
+      activeDownloads: activeChildProcesses.size,
+    });
+  });
+
+  // Update yt-dlp in place. Platforms change often; an outdated extractor is the usual cause of failures.
+  app.post("/api/engine/update", async (_req, res) => {
+    if (activeChildProcesses.size > 0 || activeSubtitleJobs > 0) {
+      return res.status(409).json({ error: "Pause or finish active downloads before updating the engine." });
+    }
+    try {
+      const result = await mediaEngine.update();
+      log.info("ENGINE", result?.message || "Engine update finished");
+      res.status(result?.ok ? 200 : 502).json({ ...result, ...(result?.ok ? {} : { error: result?.message }) });
+    } catch (error) {
+      res.status(500).json({ error: (error as Error).message || "Engine update failed." });
+    } finally {
+      tryProcessNextJob();
+    }
+  });
+
+  // Download one subtitle track as SRT or WebVTT.
+  let activeSubtitleJobs = 0;
+  app.get("/api/subtitles", async (req, res) => {
+    const lang = req.query.lang;
+    const format = req.query.format === 'vtt' ? 'vtt' : 'srt';
+    const auto = req.query.auto === '1' || req.query.auto === 'true';
+    if (!isValidSubtitleLanguage(lang)) return res.status(400).json({ error: "Choose a valid subtitle language." });
+    if (activeSubtitleJobs >= 2) return res.status(429).json({ error: "Another subtitle download is running. Retry in a moment." });
+    if (mediaEngine.isUpdating) return res.status(503).json({ error: "The download engine is updating. Retry in a moment." });
+    activeSubtitleJobs++;
+    const workDirectory = path.join(CONVERTED_DIR, `subtitle-${crypto.randomUUID()}`);
+    try {
+      const { url } = await prepareMediaUrl(req.query.url);
+      const file = await downloadSubtitle({
+        executable: YT_DLP_PATH, ffmpegDirectory: FFMPEG_DIR, runtimeArgs: getYtDlpRuntimeArgs(),
+        url, lang, auto, format, workDirectory,
+      });
+      const rawTitle = typeof req.query.title === 'string' ? req.query.title : 'subtitles';
+      const baseName = rawTitle.normalize('NFKC').replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').replace(/[. ]+$/g, '').slice(0, 120).trim() || 'subtitles';
+      res.setHeader('Cache-Control', 'no-store');
+      res.download(file, `${baseName}.${lang}${path.extname(file)}`, () => {
+        void fs.promises.rm(workDirectory, { recursive: true, force: true });
+      });
+    } catch (error: any) {
+      void fs.promises.rm(workDirectory, { recursive: true, force: true });
+      if (!res.headersSent) res.status(error?.status === 400 ? 400 : 502).json({ error: error?.message || 'Subtitle download failed.' });
+    } finally {
+      activeSubtitleJobs--;
+    }
   });
 
   app.post("/api/analyze", async (req, res) => {
     try {
-      let { url } = req.body;
-      if (!url) {
-        return res.status(400).json({ error: "URL is required" });
-      }
+      const prepared = await prepareMediaUrl(req.body?.url);
+      const url = prepared.url;
+      const isMockUrl = prepared.demo;
+      const urlCheck = { valid: true };
 
-      // Automatically extract URL if raw mobile share text was submitted
-      url = extractMediaUrlFromText(url);
-      const isMockUrl = isDemoUrl(url);
-
-      if (!isMockUrl) {
-        const initialUrlCheck = isValidMediaUrl(url);
-        if (!initialUrlCheck.valid) {
-          return res.status(400).json({ error: initialUrlCheck.error });
-        }
-        url = await resolveShortMediaUrl(url);
-        url = normalizeMediaUrl(url);
-      }
-
-      const urlCheck = isValidMediaUrl(url);
-      if (!urlCheck.valid) {
-        return res.status(400).json({ error: urlCheck.error });
-      }
-
-      // Comprehensive provider detection
-      let provider = "unknown";
-      if (url.includes("youtube.com") || url.includes("youtu.be")) {
-        provider = "youtube";
-      } else if (url.includes("tiktok.com") || url.includes("vt.tiktok.com") || url.includes("vm.tiktok.com")) {
-        provider = "tiktok";
-      } else if (url.includes("douyin.com") || url.includes("iesdouyin.com")) {
-        provider = "douyin";
-      } else if (url.includes("facebook.com") || url.includes("fb.watch")) {
-        provider = "facebook";
-      } else if (url.includes("instagram.com")) {
-        provider = "instagram";
-      } else if (url.includes("bilibili.com") || url.includes("b23.tv")) {
-        provider = "bilibili";
-      } else if (url.includes("twitter.com") || url.includes("x.com")) {
-        provider = "twitter";
-      } else if (url.includes("reddit.com")) {
-        provider = "reddit";
-      } else if (url.includes("vimeo.com")) {
-        provider = "vimeo";
-      } else if (url.includes("pinterest.com") || url.includes("pin.it")) {
-        provider = "pinterest";
-      } else if (url.includes("xiaohongshu.com") || url.includes("xhslink.com")) {
-        provider = "xiaohongshu";
-      } else if (url.includes("soundcloud.com")) {
-        provider = "soundcloud";
-      }
+      // Hostname-based provider detection; generic sites are refined from yt-dlp's extractor below.
+      let provider: string = detectProviderFromUrl(url);
+      if (provider === "generic") provider = "unknown";
 
       const isPlaylist = isPlaylistUrl(url, provider);
 
@@ -2035,7 +1686,7 @@ async function startServer() {
           const listMatch = url.match(/[?&]list=([^&#]+)/);
           const playlistId = listMatch ? listMatch[1] : "playlist";
 
-          if (vMatch) {
+          if (vMatch && provider === "youtube" && /^[A-Za-z0-9_-]{6,20}$/.test(vMatch[1])) {
             const videoId = vMatch[1];
             try {
               const singleUrl = `https://www.youtube.com/watch?v=${videoId}`;
@@ -2082,39 +1733,14 @@ async function startServer() {
           const info = await getYtDlpInfo(url);
 
           // Infer provider from extractor if not yet known
-          if (provider === "unknown" && (info.extractor_key || info.extractor)) {
-            const ext = (info.extractor_key || info.extractor || "").toLowerCase();
-            if (ext.includes("youtube")) provider = "youtube";
-            else if (ext.includes("tiktok")) provider = "tiktok";
-            else if (ext.includes("douyin")) provider = "douyin";
-            else if (ext.includes("facebook")) provider = "facebook";
-            else if (ext.includes("instagram")) provider = "instagram";
-            else if (ext.includes("bilibili")) provider = "bilibili";
-            else if (ext.includes("twitter")) provider = "twitter";
-            else if (ext.includes("reddit")) provider = "reddit";
-            else if (ext.includes("vimeo")) provider = "vimeo";
-            else if (ext.includes("pinterest")) provider = "pinterest";
-            else if (ext.includes("xiaohongshu") || ext.includes("xhs")) provider = "xiaohongshu";
-            else if (ext.includes("soundcloud")) provider = "soundcloud";
-            else provider = "generic";
-          }
+          if (provider === "unknown") provider = providerFromExtractor(info.extractor_key || info.extractor);
 
           // Preserve each distinct stream and its actual resolution, frame rate, codec, and container.
           const formats = buildMediaFormatList(info);
 
-          // Extract subtitles
-          const subtitles: { lang: string; name: string; url?: string }[] = [];
-          const allSubs = { ...(info.subtitles || {}), ...(info.automatic_captions || {}) };
-          for (const [lang, subList] of Object.entries(allSubs)) {
-            const first = (subList as any[])?.[0];
-            if (first) {
-              subtitles.push({
-                lang,
-                name: first.name || lang,
-                url: first.url
-              });
-            }
-          }
+          // Creator subtitles first, then only the original-language auto captions (not 100+ machine translations).
+          // Tracks are downloaded through /api/subtitles so the user gets a real SRT/VTT file.
+          const subtitles = selectSubtitleTracks(info);
 
           let thumbnail = info.thumbnail || "";
           if (!thumbnail && info.thumbnails && info.thumbnails.length > 0) {
@@ -2132,7 +1758,9 @@ async function startServer() {
             author: info.uploader || info.channel || info.creator || info.artist || "Unknown Creator",
             duration: info.duration || 0,
             formats,
-            subtitles: subtitles.slice(0, 15),
+            subtitles,
+            chapters: Array.isArray(info.chapters) ? info.chapters.length : 0,
+            isLive: info.is_live === true,
             isPlaylist: false,
           });
         } catch (err: any) {
@@ -2150,7 +1778,7 @@ async function startServer() {
 
       throw new Error(`Unsupported or invalid URL`);
     } catch (err: any) {
-      res.status(500).json({ error: err.message || "Unknown error" });
+      res.status(err?.status === 400 ? 400 : 500).json({ error: err.message || "Unknown error" });
     }
   });
 
@@ -2177,19 +1805,10 @@ async function startServer() {
         setMaxConcurrentDownloads(requestedLimit);
       }
 
-      url = extractMediaUrlFromText(url);
-      const isMock = isDemoUrl(url);
-      if (!isMock) {
-        const initialUrlCheck = isValidMediaUrl(url);
-        if (!initialUrlCheck.valid) {
-          return res.status(400).json({ error: initialUrlCheck.error });
-        }
-        url = await resolveShortMediaUrl(url);
-        url = normalizeMediaUrl(url);
-        const urlCheck = isValidMediaUrl(url);
-        if (!urlCheck.valid) {
-          return res.status(400).json({ error: urlCheck.error });
-        }
+      ({ url } = await prepareMediaUrl(url));
+      if (!provider || provider === 'unknown' || provider === 'generic') {
+        const detected = detectProviderFromUrl(url);
+        if (detected !== 'generic' && detected !== 'unknown') provider = detected;
       }
 
       const jobId = crypto.randomUUID();
@@ -2221,6 +1840,7 @@ async function startServer() {
         type: isAudio ? "audio" : "video",
         filenameTemplate,
         filenameQuality: typeof filenameQuality === "string" ? filenameQuality.slice(0, 32) : undefined,
+        embedMetadata: req.body.embedMetadata !== false,
         filePath,
         fileName,
         mimeType: isAudio
@@ -2239,8 +1859,8 @@ async function startServer() {
       persistDownloadQueue(true); await downloadJournal.flush();
       return res.json({ jobId, status: newJob.status, queuePosition: newJob.queuePosition, job: publicDownloadRecord(newJob) });
     } catch (err: any) {
-      console.error("Queueing error:", err);
-      res.status(500).json({ error: err.message || "Queue insertion failed" });
+      if (err?.status !== 400) log.error("QUEUE", "Queueing error", err);
+      res.status(err?.status === 400 ? 400 : 500).json({ error: err.message || "Queue insertion failed" });
     }
   });
 
@@ -2262,36 +1882,11 @@ async function startServer() {
         setMaxConcurrentDownloads(requestedLimit);
       }
 
-      url = extractMediaUrlFromText(url);
-      const isMock = isDemoUrl(url);
-      if (!isMock) {
-        const initialUrlCheck = isValidMediaUrl(url);
-        if (!initialUrlCheck.valid) {
-          return res.status(400).json({ error: initialUrlCheck.error });
-        }
-        url = await resolveShortMediaUrl(url);
-        url = normalizeMediaUrl(url);
-      }
+      const prepared = await prepareMediaUrl(url);
+      url = prepared.url;
+      const isMock = prepared.demo;
 
-      const urlCheck = isValidMediaUrl(url);
-      if (!urlCheck.valid) {
-        return res.status(400).json({ error: urlCheck.error });
-      }
-
-      // Infer provider
-      let provider = "unknown";
-      if (url.includes("youtube.com") || url.includes("youtu.be")) provider = "youtube";
-      else if (url.includes("tiktok.com") || url.includes("vt.tiktok.com") || url.includes("vm.tiktok.com")) provider = "tiktok";
-      else if (url.includes("douyin.com") || url.includes("iesdouyin.com")) provider = "douyin";
-      else if (url.includes("facebook.com") || url.includes("fb.watch")) provider = "facebook";
-      else if (url.includes("instagram.com")) provider = "instagram";
-      else if (url.includes("bilibili.com") || url.includes("b23.tv")) provider = "bilibili";
-      else if (url.includes("twitter.com") || url.includes("x.com")) provider = "twitter";
-      else if (url.includes("reddit.com")) provider = "reddit";
-      else if (url.includes("vimeo.com")) provider = "vimeo";
-      else if (url.includes("pinterest.com") || url.includes("pin.it")) provider = "pinterest";
-      else if (url.includes("xiaohongshu.com") || url.includes("xhslink.com")) provider = "xiaohongshu";
-      else if (url.includes("soundcloud.com")) provider = "soundcloud";
+      let provider: string = detectProviderFromUrl(url);
 
       let title = "Direct Media Download";
       let thumbnail = "";
@@ -2303,6 +1898,7 @@ async function startServer() {
       if (!isMock) {
         try {
           const info = await getYtDlpInfo(url);
+          if (provider === "generic") provider = providerFromExtractor(info.extractor_key || info.extractor);
           title = info.title || info.description || "Direct Media Download";
           duration = info.duration || 0;
           if (info.thumbnail) thumbnail = info.thumbnail;
@@ -2351,6 +1947,7 @@ async function startServer() {
         type: isAudio ? "audio" : "video",
         filenameTemplate,
         filenameQuality: String(quality).slice(0, 32),
+        embedMetadata: req.body.embedMetadata !== false,
         filePath,
         fileName,
         mimeType: isAudio ? "audio/mpeg" : "video/mp4",
@@ -2376,64 +1973,60 @@ async function startServer() {
         job: publicDownloadRecord(newJob)
       });
     } catch (err: any) {
-      log.error("DIRECT_QUEUE", "Direct queue error", err);
-      res.status(500).json({ error: err.message || "Direct queue insertion failed" });
+      if (err?.status !== 400) log.error("DIRECT_QUEUE", "Direct queue error", err);
+      res.status(err?.status === 400 ? 400 : 500).json({ error: err.message || "Direct queue insertion failed" });
     }
   });
 
   // Direct In-Browser Media Stream Pipe (Zero Server-Disk Retention Stream)
+  let activeStreams = 0;
   app.get("/api/stream", async (req, res) => {
+    const itag = typeof req.query.itag === 'string' && req.query.itag.length <= 256 ? req.query.itag : "best";
+    const type = req.query.type === 'audio' ? 'audio' : 'video';
+    if (typeof req.query.url !== 'string' || !req.query.url) return res.status(400).json({ error: "Target URL is required" });
+    if (activeStreams >= 3) return res.status(429).json({ error: "Too many live streams are running. Retry in a moment." });
+    activeStreams++;
+    let released = false;
+    const release = () => { if (!released) { released = true; activeStreams--; } };
+    res.once('close', release);
     try {
-      let targetUrl = req.query.url as string;
-      const itag = (req.query.itag as string) || "best";
-      const type = (req.query.type as 'video' | 'audio') || "video";
-
-      if (!targetUrl) {
-        return res.status(400).send("Target URL is required");
-      }
-
-      targetUrl = extractMediaUrlFromText(targetUrl);
-      targetUrl = await resolveShortMediaUrl(targetUrl);
-      targetUrl = normalizeMediaUrl(targetUrl);
-
-      const urlCheck = isValidMediaUrl(targetUrl);
-      if (!urlCheck.valid) {
-        return res.status(400).send(urlCheck.error);
-      }
+      const { url: targetUrl } = await prepareMediaUrl(req.query.url);
+      if (res.writableEnded || res.destroyed) return release();
 
       const isAudio = type === 'audio' || isAudioFormatToken(itag);
-      const ext = isAudio ? 'mp3' : 'mp4';
-      const formatArg = getYtDlpFormatArg(itag, isAudio ? 'audio' : 'video');
-
-      res.header("Content-Disposition", `attachment; filename="stream_${Date.now()}.${ext}"`);
-      res.header("Content-Type", isAudio ? "audio/mpeg" : "video/mp4");
-      res.header("X-Content-Type-Options", "nosniff");
-
-      const runtimeArgs = getYtDlpRuntimeArgs();
-      const args = [
-        "--no-playlist",
-        "--no-warnings",
-        ...runtimeArgs,
-        "-f", formatArg,
-        "-o", "-",
-        targetUrl
-      ];
-
-      const child = spawn(YT_DLP_PATH, args);
-
-      child.stdout.pipe(res);
-
-      req.on("close", () => {
-        try { child.kill(); } catch {}
+      // Streaming to stdout cannot merge separate video and audio tracks, so prefer single-file formats.
+      const formatArg = isAudio ? 'bestaudio/best' : (/^yt:(video|raw):/.test(itag) ? getYtDlpFormatArg(itag, 'video') : 'best[vcodec!=none][acodec!=none]/best');
+      const args = ["--no-playlist", "--no-warnings", "--no-part", ...getYtDlpRuntimeArgs(), "-f", formatArg, "-o", "-", "--", targetUrl];
+      const child = spawn(YT_DLP_PATH, args, { windowsHide: true });
+      let stderr = '';
+      let sentBytes = 0;
+      // yt-dlp writes progress to stderr when streaming; it must be drained or the pipe fills and stalls.
+      child.stderr.on('data', (chunk) => { stderr = (stderr + chunk.toString()).slice(-8000); });
+      child.stdout.once('data', () => {
+        if (res.headersSent) return;
+        res.status(200);
+        res.header("Content-Disposition", `attachment; filename="stream_${Date.now()}.${isAudio ? 'm4a' : 'mp4'}"`);
+        res.header("Content-Type", isAudio ? "audio/mp4" : "video/mp4");
+        res.header("Cache-Control", "no-store");
       });
-
+      child.stdout.on('data', (chunk: Buffer) => { sentBytes += chunk.length; });
+      // End the response ourselves so a failure before the first byte can still return an error.
+      child.stdout.pipe(res, { end: false });
+      const stop = () => { if (child.exitCode === null) { try { child.kill(); } catch {} } };
+      res.once('close', stop);
       child.on("error", (err) => {
         log.error("STREAM", "Stream child error", err);
-        if (!res.headersSent) res.status(500).send("Streaming process error");
+        if (!res.headersSent) res.status(500).json({ error: "Streaming process error" });
+      });
+      child.on("close", (code) => {
+        if (sentBytes > 0 || res.headersSent) { res.end(); return; }
+        const classified = code === 0 ? { message: 'The source returned no media data.', category: 'UNKNOWN' } : classifyMediaError(stderr, detectProviderFromUrl(targetUrl));
+        res.status(502).json({ error: classified.message, category: classified.category });
       });
     } catch (err: any) {
-      log.error("STREAM", "Stream error", err);
-      if (!res.headersSent) res.status(500).send("Streaming initialization failed");
+      release();
+      if (err?.status !== 400) log.error("STREAM", "Stream error", err);
+      if (!res.headersSent) res.status(err?.status === 400 ? 400 : 500).json({ error: err?.message || "Streaming initialization failed" });
     }
   });
 
@@ -2477,33 +2070,40 @@ async function startServer() {
     try {
       const parsed = new URL(targetUrl);
       const client = parsed.protocol === 'https:' ? https : http;
+      const maxBytes = 10 * 1024 * 1024;
 
-      const proxyReq = client.get(targetUrl, (imgRes) => {
-        if (imgRes.statusCode !== 200) {
-          return res.status(imgRes.statusCode || 400).send("Failed to retrieve remote thumbnail");
-        }
+      // publicOnlyLookup refuses hosts that resolve to private addresses (DNS-based SSRF).
+      const proxyReq = client.get(targetUrl, { lookup: publicOnlyLookup, headers: { 'User-Agent': 'Mozilla/5.0 Pullio thumbnail fetcher', Accept: 'image/*' } }, (imgRes) => {
+        const contentType = String(imgRes.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+        const contentLength = parseInt(String(imgRes.headers['content-length'] || '0'), 10);
+        const reject = (status: number, message: string) => { imgRes.resume(); if (!res.headersSent) res.status(status).send(message); };
+        if (imgRes.statusCode !== 200) return reject(502, "Failed to retrieve remote thumbnail");
+        if (!/^image\/(jpeg|png|webp|gif|avif|bmp)$/.test(contentType)) return reject(400, "Remote resource is not an image");
+        if (contentLength > maxBytes) return reject(400, "Thumbnail image exceeds maximum size limit (10MB)");
 
-        const contentType = imgRes.headers['content-type'] || '';
-        if (!contentType.startsWith('image/')) {
-          return res.status(400).send("Remote resource is not an image");
-        }
-
-        const contentLength = parseInt(imgRes.headers['content-length'] || '0', 10);
-        if (contentLength > 10 * 1024 * 1024) {
-          return res.status(400).send("Thumbnail image exceeds maximum size limit (10MB)");
-        }
-
-        res.header("Content-Disposition", `attachment; filename="${safeTitle || 'thumbnail'}_thumb.jpg"`);
+        const extension = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/avif': 'avif', 'image/bmp': 'bmp' }[contentType] || 'jpg';
+        res.header("Content-Disposition", `attachment; filename="${safeTitle || 'thumbnail'}_thumb.${extension}"`);
         res.header("Content-Type", contentType);
         res.header("X-Content-Type-Options", "nosniff");
+        res.header("Cache-Control", "no-store");
 
+        let received = 0;
+        imgRes.on('data', (chunk: Buffer) => {
+          received += chunk.length;
+          if (received > maxBytes) { imgRes.destroy(); res.destroy(); }
+        });
         imgRes.pipe(res);
       });
 
-      proxyReq.on('error', (err) => {
+      proxyReq.on('error', (err: NodeJS.ErrnoException) => {
+        if (err.code === 'EPRIVATEADDR') {
+          if (!res.headersSent) res.status(400).send("Access to private or local network hosts is restricted.");
+          return;
+        }
         log.error("THUMB", "Thumbnail proxy fetch error", err);
-        if (!res.headersSent) res.status(500).send("Failed to retrieve thumbnail");
+        if (!res.headersSent) res.status(502).send("Failed to retrieve thumbnail");
       });
+      res.once('close', () => proxyReq.destroy());
 
       proxyReq.setTimeout(10000, () => {
         proxyReq.destroy();
@@ -2649,30 +2249,33 @@ async function startServer() {
       if (!Array.isArray(urls) || urls.length === 0) {
         return res.status(400).json({ error: "urls array is required" });
       }
-      const results = [];
-      for (const rawItem of urls.slice(0, 8)) {
-        let itemUrl = extractMediaUrlFromText(rawItem);
-        itemUrl = await resolveShortMediaUrl(itemUrl);
-
-        const check = isValidMediaUrl(itemUrl);
-        if (!check.valid) {
-          results.push({ url: itemUrl, error: check.error, valid: false });
-          continue;
+      const items = urls.slice(0, 8);
+      const results: any[] = new Array(items.length);
+      // Analyze up to three links at a time; one failing link never fails the whole batch.
+      let next = 0;
+      const worker = async () => {
+        while (next < items.length) {
+          const index = next++;
+          const rawItem = items[index];
+          try {
+            const { url: itemUrl } = await prepareMediaUrl(rawItem);
+            const info = await getYtDlpInfo(itemUrl);
+            results[index] = {
+              url: itemUrl,
+              valid: true,
+              provider: detectProviderFromUrl(itemUrl) === 'generic' ? providerFromExtractor(info.extractor_key || info.extractor) : detectProviderFromUrl(itemUrl),
+              title: info.title || "Untitled Media",
+              thumbnail: info.thumbnail || "",
+              author: info.uploader || info.channel || "Creator",
+              duration: info.duration || 0
+            };
+          } catch (err: any) {
+            const classified = err?.status === 400 ? { message: err.message } : classifyMediaError(err);
+            results[index] = { url: typeof rawItem === 'string' ? rawItem.slice(0, 2000) : '', error: classified.message, valid: false };
+          }
         }
-        try {
-          const info = await getYtDlpInfo(itemUrl);
-          results.push({
-            url: itemUrl,
-            valid: true,
-            title: info.title || "Untitled Media",
-            thumbnail: info.thumbnail || "",
-            author: info.uploader || info.channel || "Creator",
-            duration: info.duration || 0
-          });
-        } catch (err: any) {
-          results.push({ url: itemUrl, error: err.message, valid: false });
-        }
-      }
+      };
+      await Promise.all(Array.from({ length: Math.min(3, items.length) }, worker));
       return res.json({ items: results });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -2686,13 +2289,24 @@ async function startServer() {
 
   app.post("/api/cookies", (req, res) => {
     try {
-      const { cookies, domain } = req.body;
+      const { cookies, domain } = req.body || {};
       if (!cookies || typeof cookies !== "string" || !cookies.trim()) {
         return res.status(400).json({ error: "Cookie string or Netscape content is required" });
       }
+      if (cookies.length > 1024 * 1024) return res.status(413).json({ error: "Cookie content is larger than 1 MB." });
+      const targetDomain = domain === undefined || domain === '' ? ".bilibili.com" : domain;
+      if (typeof targetDomain !== "string" || !COOKIE_DOMAIN_PATTERN.test(targetDomain)) {
+        return res.status(400).json({ error: "Choose a valid cookie domain, such as .youtube.com." });
+      }
 
-      const formatted = parseRawCookieStringToNetscape(cookies.trim(), domain || ".bilibili.com");
-      fs.writeFileSync(COOKIES_FILE, formatted, "utf-8");
+      const formatted = parseRawCookieStringToNetscape(cookies.trim(), targetDomain.startsWith('.') ? targetDomain : `.${targetDomain}`);
+      if (!cookieLines(formatted).length) {
+        return res.status(400).json({ error: "No cookies were found. Paste Netscape cookies.txt content or name=value pairs." });
+      }
+      // Merge so saving one platform's session keeps the others.
+      const existing = fs.existsSync(COOKIES_FILE) ? fs.readFileSync(COOKIES_FILE, "utf-8") : "";
+      writeCookiesFile(mergeCookieContent(existing, formatted));
+      lastSanitizedMtime = 0;
       log.info("AUTH", "Saved cookies.txt for platform authentication");
 
       return res.json({
@@ -2706,13 +2320,20 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/cookies", (_req, res) => {
+  app.delete("/api/cookies", (req, res) => {
     try {
+      const domain = typeof req.query.domain === 'string' ? req.query.domain : '';
+      if (domain) {
+        if (!COOKIE_DOMAIN_PATTERN.test(domain)) return res.status(400).json({ error: "Choose a valid cookie domain." });
+        const removed = removeCookieDomain(domain);
+        log.info("AUTH", `Removed ${removed} cookies for ${domain}`);
+        return res.json({ success: true, message: `Removed cookies for ${domain.replace(/^\./, '')}`, removed, ...getCookiesSummary() });
+      }
       if (fs.existsSync(COOKIES_FILE)) {
         fs.unlinkSync(COOKIES_FILE);
       }
       log.info("AUTH", "Cleared cookies.txt");
-      return res.json({ success: true, message: "Cookies cleared", configured: false });
+      return res.json({ success: true, message: "Cookies cleared", ...getCookiesSummary() });
     } catch (err: any) {
       return res.status(500).json({ error: err.message || "Failed to clear cookies" });
     }
@@ -2990,13 +2611,8 @@ async function startServer() {
     if (!job) {
       return res.status(404).json({ error: "Conversion job not found" });
     }
-    return res.json({
-      success: true,
-      job: {
-        ...job,
-        downloadUrl: `/api/convert/download/${job.jobId}`,
-      },
-    });
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({ success: true, job: publicConversionJob(job) });
   });
 
   // Download converted file
@@ -3033,9 +2649,12 @@ async function startServer() {
     res.attachment(job.outputFileName || `${jobId}.${ext}`);
     res.header("Content-Type", mimeTypes[ext] || "application/octet-stream");
     res.header("X-Content-Type-Options", "nosniff");
-
-    const stream = fs.createReadStream(job.outputPath);
-    stream.pipe(res);
+    res.setHeader('Cache-Control', 'no-store');
+    try { const now = new Date(); fs.utimesSync(job.outputPath, now, now); } catch {}
+    // sendFile handles range requests and read errors (a bare read stream would crash the process on error).
+    res.sendFile(job.outputPath, (error) => {
+      if (error && !res.headersSent) res.status(404).send("Converted file not found or still processing");
+    });
   });
 
   // Cancel conversion job or delete files
@@ -3198,7 +2817,8 @@ function enqueueDownloadJob(jobId: string) {
 }
 
 function tryProcessNextJob() {
-  if (shuttingDown) return;
+  // Hold queued jobs while the engine binary is being replaced; the update handler restarts the queue.
+  if (shuttingDown || mediaEngine.isUpdating) return;
   while (activeDownloadsCount < maxConcurrentDownloads && pendingDownloadQueue.length > 0) {
     const jobId = pendingDownloadQueue.shift();
     if (!jobId) continue;
@@ -3223,6 +2843,12 @@ function releaseDownloadSlot(jobId: string) {
   tryProcessNextJob();
 }
 
+/** Titles the clients use before the real one is known (batch links, direct downloads, recovery). */
+function isPlaceholderTitle(title: string | undefined): boolean {
+  const value = String(title || '').trim();
+  return !value || /^(?:Batch \w+ Item|Media Download|Direct Media Download|Recovered download|Downloaded media)$/i.test(value);
+}
+
 // Download workers preserve partial files and report explicit processing stages.
 async function processDownloadJob(jobId: string) {
   const job = jobQueue.get(jobId);
@@ -3237,6 +2863,16 @@ async function processDownloadJob(jobId: string) {
       current: () => jobQueue.get(jobId) === job && job.status === 'downloading' && !shuttingDown,
       update: (force) => broadcastJobUpdate(jobId, force),
       stop: () => stopDownloadProcess(jobId),
+      metadata: (meta) => {
+        // Links queued without analysis carry placeholder titles; use the real ones for the
+        // transfer card, history, and the saved file name.
+        const title = typeof meta.title === 'string' ? meta.title.replace(/[\u0000-\u001f]/g, '').trim().slice(0, 300) : '';
+        const thumbnail = typeof meta.thumbnail === 'string' && /^https?:\/\//i.test(meta.thumbnail) ? meta.thumbnail.slice(0, 2000) : '';
+        let changed = false;
+        if (title && isPlaceholderTitle(job.title)) { job.title = title; changed = true; }
+        if (thumbnail && !job.thumbnail) { job.thumbnail = thumbnail; changed = true; }
+        if (changed) broadcastJobUpdate(jobId, true);
+      },
       complete: (filePath) => {
         const extension = path.extname(filePath).toLowerCase();
         const mime: Record<string, string> = {
@@ -3258,6 +2894,26 @@ async function processDownloadJob(jobId: string) {
     if (jobQueue.get(jobId) !== job || job.status !== 'downloading' || shuttingDown) return;
     const reason = error instanceof Error ? error.message : 'The download could not finish.';
     const classified = classifyMediaError(reason, job.provider);
+    // Cover-art/metadata embedding is optional: if it is what failed, keep the media and retry without it.
+    if (job.embedMetadata !== false && /EmbedThumbnail|thumbnail|FFmpegMetadata|Postprocessing:/i.test(reason) && !/HTTP Error 4\d\d|Unable to download (video|webpage)/i.test(reason)) {
+      job.embedMetadata = false;
+      job.status = 'queued'; job.stage = 'queued'; job.eta = 'Retrying without cover art…';
+      log.warn("QUEUE", `Job ${jobId} failed while embedding metadata; retrying without it.`);
+      broadcastJobUpdate(jobId, true);
+      setTimeout(() => { if (jobQueue.get(jobId) === job && job.status === 'queued') enqueueDownloadJob(jobId); }, 300);
+      return;
+    }
+    // Some mirrors only reveal DRM once the download starts. Let yt-dlp choose another stream at the
+    // same resolution (its height-capped selectors skip DRM formats) instead of failing the job.
+    if (/DRM protected/i.test(reason) && String(job.itag).startsWith('yt:')) {
+      const height = String(job.filenameQuality || '').match(/^(\d{3,4})p\b/)?.[1];
+      job.itag = job.type === 'audio' ? 'bestaudio' : height ? `${height}p` : 'best';
+      job.status = 'queued'; job.stage = 'queued'; job.eta = 'Trying another stream…';
+      log.warn("QUEUE", `Job ${jobId} hit a DRM-protected stream; retrying with ${job.itag}.`);
+      broadcastJobUpdate(jobId, true);
+      setTimeout(() => { if (jobQueue.get(jobId) === job && job.status === 'queued') enqueueDownloadJob(jobId); }, 300);
+      return;
+    }
     if ((job.retryCount || 0) < 1 && classified.retryable) {
       job.retryCount = (job.retryCount || 0) + 1;
       job.status = 'queued'; job.stage = 'queued'; job.eta = 'Retrying the requested format…';
@@ -3279,10 +2935,10 @@ setInterval(() => {
     );
     const activeInputPaths = new Set(activeConversions.map((job) => path.resolve(job.inputPath)));
 
-    // Clean downloads directory
+    // Clean downloads directory (each file is handled on its own so one failure cannot stop the sweep)
     if (fs.existsSync(DOWNLOADS_DIR)) {
       const files = fs.readdirSync(DOWNLOADS_DIR);
-      files.forEach((file) => {
+      files.forEach((file) => { try {
         const filePath = path.join(DOWNLOADS_DIR, file);
         const stats = fs.statSync(filePath);
         if (activeInputPaths.has(path.resolve(filePath))) return;
@@ -3297,7 +2953,7 @@ setInterval(() => {
             owner.filePath = undefined; owner.fileName = undefined; broadcastJobUpdate(owner.jobId, true);
           }
         }
-      });
+      } catch {} });
     }
 
     // Clean uploads and converted directories
@@ -3306,11 +2962,16 @@ setInterval(() => {
     [UPLOADS_DIR, CONVERTED_DIR].forEach((targetDir) => {
       if (!fs.existsSync(targetDir)) return;
       const cFiles = fs.readdirSync(targetDir);
-      cFiles.forEach((file) => {
+      cFiles.forEach((file) => { try {
         const filePath = path.join(targetDir, file);
         const stats = fs.statSync(filePath);
-        if (!stats.isFile() || now - stats.mtimeMs <= expiryMs) return;
-        if (activeInputPaths.has(path.resolve(filePath))) return;
+        if (now - stats.mtimeMs <= expiryMs) return;
+        // Leftover subtitle work folders (normally removed right after the download).
+        if (stats.isDirectory()) {
+          if (targetDir === CONVERTED_DIR && /^subtitle-[0-9a-f-]{36}$/.test(file)) fs.rmSync(filePath, { recursive: true, force: true });
+          return;
+        }
+        if (!stats.isFile() || activeInputPaths.has(path.resolve(filePath))) return;
 
         const fileId = file.split("_")[0];
         if (targetDir === UPLOADS_DIR && activeUploadIds.has(fileId)) return;
@@ -3322,8 +2983,17 @@ setInterval(() => {
         } else {
           conversionJobs.delete(fileId);
         }
-      });
+      } catch {} });
     });
+
+    // Forget finished conversion records whose output no longer exists (failed jobs never had one).
+    for (const [jobId, job] of conversionJobs) {
+      if (['queued', 'converting'].includes(job.status)) continue;
+      if (now - job.createdAt > expiryMs && (!job.outputPath || !fs.existsSync(job.outputPath))) {
+        conversionJobs.delete(jobId);
+        lastConvertBroadcastTime.delete(jobId);
+      }
+    }
   } catch (err) {
     console.error("Cleanup daemon encountered an error:", err);
   }

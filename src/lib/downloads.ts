@@ -14,6 +14,22 @@ export interface DownloadRecord {
   title: string; thumbnail: string; type: 'video' | 'audio'; filenameTemplate: string;
   filenameQuality?: string; outputFileName?: string; retryCount?: number;
   createdAt: number; updatedAt: number; recoveryMessage?: string;
+  /** Write title/artist/date tags, chapters, and cover art into the file where the container supports it. */
+  embedMetadata?: boolean;
+}
+
+/** Containers where yt-dlp can embed a cover image (it fails the job for others, e.g. WebM). */
+const THUMBNAIL_CONTAINERS = new Set(['mp3', 'm4a', 'mp4', 'mkv']);
+
+/** yt-dlp post-processing arguments for embedding metadata, chapters, and cover art. */
+export function metadataEmbedArgs(job: Pick<DownloadRecord, 'type' | 'itag' | 'targetContainer' | 'embedMetadata'>): string[] {
+  if (job.embedMetadata === false) return [];
+  const args = ['--embed-metadata'];
+  const container = String(job.targetContainer || '').toLowerCase();
+  const originalAudio = String(job.itag).toLowerCase().startsWith('yt:audio-source:');
+  if (job.type === 'video') args.push('--embed-chapters');
+  if (!originalAudio && THUMBNAIL_CONTAINERS.has(container)) args.push('--embed-thumbnail', '--convert-thumbnails', 'jpg');
+  return args;
 }
 
 export function isDemoMediaUrl(value: string, enabled = false): boolean {

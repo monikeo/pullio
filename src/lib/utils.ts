@@ -1,5 +1,6 @@
 import { type ClassValue, clsx } from "clsx"
 import { twMerge } from "tailwind-merge"
+import { detectProviderFromUrl } from "./providers"
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
@@ -17,7 +18,8 @@ export function formatDuration(seconds: number) {
 }
 
 export function getYouTubeVideoId(url: string): string | null {
-  const regExp = /^.*(youtu\.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
+  // Covers watch?v=, youtu.be/, /embed/, /v/, /shorts/, and /live/ links.
+  const regExp = /^.*(youtu\.be\/|v\/|u\/\w\/|embed\/|shorts\/|live\/|watch\?v=|[?&]v=)([^#&?/]*).*/;
   const match = url.match(regExp);
   if (match && match[2] && /^[a-zA-Z0-9_-]{11}$/.test(match[2])) {
     return match[2];
@@ -156,23 +158,11 @@ export function extractMediaUrl(input: string): string {
   return cleanMediaTrackingParams(candidate);
 }
 
-/** Detect media provider with support for Douyin, Pinterest, Vimeo, XiaoHongShu */
+/** Detect the media platform from the URL's hostname (shared with the server). */
 export function detectMediaProvider(targetUrl: string): import('../types').ProviderType {
-  const cleanUrl = targetUrl.toLowerCase().trim();
-  if (!cleanUrl) return 'unknown';
-  if (cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be')) return 'youtube';
-  if (cleanUrl.includes('tiktok.com') || cleanUrl.includes('vt.tiktok.com') || cleanUrl.includes('vm.tiktok.com')) return 'tiktok';
-  if (cleanUrl.includes('douyin.com') || cleanUrl.includes('iesdouyin.com')) return 'douyin';
-  if (cleanUrl.includes('facebook.com') || cleanUrl.includes('fb.watch')) return 'facebook';
-  if (cleanUrl.includes('instagram.com')) return 'instagram';
-  if (cleanUrl.includes('bilibili.com') || cleanUrl.includes('b23.tv')) return 'bilibili';
-  if (cleanUrl.includes('twitter.com') || cleanUrl.includes('x.com')) return 'twitter';
-  if (cleanUrl.includes('reddit.com')) return 'reddit';
-  if (cleanUrl.includes('vimeo.com')) return 'vimeo';
-  if (cleanUrl.includes('pinterest.com') || cleanUrl.includes('pin.it')) return 'pinterest';
-  if (cleanUrl.includes('xiaohongshu.com') || cleanUrl.includes('xhslink.com')) return 'xiaohongshu';
-  if (cleanUrl.includes('soundcloud.com')) return 'soundcloud';
-  return 'generic';
+  if (!targetUrl || !targetUrl.trim()) return 'unknown';
+  const provider = detectProviderFromUrl(extractMediaUrl(targetUrl) || targetUrl);
+  return provider === 'unknown' ? 'generic' : provider;
 }
 
 export * from './security';

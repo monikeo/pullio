@@ -18,7 +18,8 @@ export interface Formats {
 export interface SubtitleTrack {
   lang: string;
   name: string;
-  url?: string;
+  /** True for automatically generated captions. */
+  auto?: boolean;
 }
 
 export interface PlaylistItem {
@@ -39,6 +40,8 @@ export interface VideoMetadata {
   duration: number;
   formats: Formats[];
   subtitles?: SubtitleTrack[];
+  chapters?: number;
+  isLive?: boolean;
   isPlaylist?: boolean;
   playlistItems?: PlaylistItem[];
 }
@@ -85,12 +88,15 @@ export interface DownloadHistoryItem {
 }
 
 export interface UserPreferences {
-  defaultFormat: 'best' | '1080p' | '720p' | 'audio-320' | 'audio-128';
+  defaultFormat: 'best' | '2160p' | '1440p' | '1080p' | '720p' | '480p' | '360p' | 'audio-320' | 'audio-128';
   defaultContainer: 'mp4' | 'mkv' | 'webm' | 'mp3';
   maxConcurrentDownloads: 1 | 2 | 3 | 4;
   filenameTemplate: string;
   autoAnalyzeOnPaste: boolean;
+  /** Show a system notification when a download or conversion finishes while Pullio is in the background. */
   notifyOnComplete: boolean;
+  /** Embed title/artist tags, chapters, and cover art into downloaded files. */
+  embedMetadata: boolean;
 }
 
 export type TargetVideoFormat = 'mp4' | 'mkv' | 'webm' | 'mov' | 'avi' | 'flv' | 'wmv' | 'gif';
