@@ -9,13 +9,18 @@ A high-performance, self-hosted media extraction and transcoding platform built 
 - **Audio Studio**: Choose **Enhance audio** on a local converter item, completed download, converted file, or history entry. Clean continuous noise with adaptive wavelet denoising, remove 50/60 Hz electrical hum, quiet pauses, repair clicks, and tame sibilance. Combine these with voice EQ, bass, clarity, and 0.5–2× speed with optional pitch preservation. Compare the original, then export MP3, WAV, FLAC, M4A, or OGG. Enhanced outputs remain in the converter queue. Server FFmpeg handles exports and cleanup previews using the original source and the existing two-worker conversion limit; closing the studio cancels unfinished processing.
 
 - **Multi-Platform Support**: Built-in extractors and cascade bypass configurations for **YouTube** (Videos, Shorts, Playlists), **TikTok**, **Douyin (抖音)**, **Facebook** (Watch, Reels, Shares), **Instagram** (Reels, Posts, Stories), **Bilibili (哔哩哔哩)**, **Vimeo**, **Pinterest**, **XiaoHongShu (小红书)**, **X (Twitter)**, and **SoundCloud**.
-- **Adaptive Multi-Tier Bypass Engine**: Built-in cascade retry mechanism that rotates client personas, headers, and player APIs (Web, Android, iOS Safari, mobile headers, and crawler bypasses) to circumvent 403 Forbidden, bot challenges, and rate limits.
+- **Resilient Extraction**: Analysis retries once over IPv4 after network failures; transient download errors retry automatically; mirrored and DRM-protected streams are filtered out; and if a stream turns out to be protected at download time, Pullio retries another stream at the same resolution. Errors name the actual cause (sign-in needed, fresh cookies, rate limit, region lock, DRM) with the fix. Pullio does not bypass CAPTCHAs or platform verification.
 - **True Resolution & Aspect-Ratio Preservation**: Intelligent dimension matching that preserves Full HD vertical portrait videos (1080x1920 Instagram Reels & YouTube Shorts) without unintended downscaling, alongside full 4K (2160p), 2K (1440p), 1080p60, 720p, 480p, and 360p stream muxing.
 - **FFmpeg Transcoding & Studio Audio**: Direct extraction and transcoding to MP3 with precision bitrate targeting (320kbps Studio Master, 256kbps High Quality, 128kbps Standard), plus lossless container remuxing to standard MP4 containers.
 - **Local Media Transcoder Suite**: Standalone conversion studio to convert local videos and audio files between MP4, MKV, WebM, MOV, AVI, FLV, WMV, GIF, MP3, WAV, FLAC, AAC, M4A, OGG, and OPUS with custom bitrate presets and CRF controls.
 - **Real-Time WebSocket Pipeline**: Zero-polling progress updates broadcast via WebSocket with throttled event emitters (150ms) to ensure smooth 60fps UI rendering during multi-gigabyte transfers.
-- **Zero-Disk In-Browser Streaming**: Direct HTTP stream pipe endpoint (`GET /api/stream`) that streams live media directly to the client browser without intermediate server disk writes.
-- **Hardened Security & Cookie Management**: Automated Latin-1 ASCII sanitization on Netscape `cookies.txt` imports to eliminate encoding crashes, SSRF safeguards on thumbnail proxies, and strict file validation.
+- **Zero-Disk In-Browser Streaming**: Direct HTTP stream pipe endpoint (`GET /api/stream`) that streams single-file media directly to the client without intermediate server disk writes. Up to three streams run at once, and a failure before the first byte returns a JSON error instead of an empty file.
+- **One-Click Engine Updates**: **Settings → Download Engine** shows the bundled yt-dlp and FFmpeg versions, how old the yt-dlp release is, and free storage. **Check for update** runs yt-dlp's self-updater against the official stable channel. Updating waits until active downloads are paused or finished, and queued jobs hold until it completes. An outdated extractor is the most common cause of failed downloads.
+- **Subtitles as Real Files**: Analysis lists creator-provided subtitles plus original-language auto captions (not the 100+ machine translations). Download any track as **SRT** or **WebVTT**; the server fetches it through yt-dlp, so signed caption URLs and your cookies are handled.
+- **Embedded Tags, Chapters & Cover Art**: Downloads include title, artist, date, and source URL tags; videos keep chapter markers; MP3, M4A, MP4, and MKV files also get cover art. If embedding fails on an unusual source, the download is retried without it. Toggle this in Settings.
+- **Faster Segmented Downloads**: HLS/DASH sources fetch four fragments in parallel.
+- **Completion Notifications**: Optional system notifications when a download or conversion finishes (or fails) while Pullio is in the background. The tab title also shows live progress, e.g. `(2) 45% · Pullio`.
+- **Hardened Security & Cookie Management**: API requests from other websites and DNS-rebinding host names are refused (see [Security model](#security-model)). URL checks resolve DNS and reject any host that points at loopback, private, link-local, or cloud-metadata addresses, including IPv4-mapped IPv6 forms. Cookies are sanitized to Latin-1 and **merged per site**, so saving YouTube cookies no longer erases your Bilibili session; remove a single site's cookies from Settings.
 
 ---
 
@@ -24,14 +29,15 @@ A high-performance, self-hosted media extraction and transcoding platform built 
 | Platform | Features Supported | Resolution & Audio Tiers | Notes / Authentication |
 | :--- | :--- | :--- | :--- |
 | **YouTube** | Videos, Shorts, Playlists, Livestream VoDs | 4K (2160p60), 2K (1440p), 1080p60, 720p, 480p, 360p, 320k MP3 | Uses native multi-client extraction. Node 22+ runtime passed for signature deciphering. |
-| **Instagram** | Reels, Posts, Stories, Carousel items | 1080p Vertical (1080x1920), 720p, Square 1:1, MP3 | Guest access or session cookies (`sessionid`) via Settings for restricted posts. |
-| **Facebook** | Watch videos, Reels, Mobile shares (`fb.watch`) | HD (1080p/720p), SD (480p/360p), MP3 Audio | Uses crawler user-agent for progressive direct streams; supports redirect following. |
+| **Instagram** | Reels, Posts, Stories, Carousel items | 1080p Vertical (1080x1920), 720p, Square 1:1, MP3 | **Needs your Instagram cookies** (`.instagram.com`, including `sessionid`): Instagram now returns empty responses to guests. |
+| **Facebook** | Watch videos, Reels, Mobile shares (`fb.watch`) | HD (1080p/720p), SD (480p/360p), MP3 Audio | Public videos work without sign-in; HD and SD are offered separately. Follows `fb.watch` and `/share/` redirects. |
 | **TikTok** | Watermark-free videos, Audio tracks | 1080p, 720p, 540p, MP3 | Automatic shortlink (`vt.tiktok.com`) redirect resolution. |
-| **Douyin (抖音)** | Video posts, Notes, User shares | Full HD 1080p, 720p, MP3 | Handles `modal_id` parameter normalization and desktop/mobile share links. |
+| **Douyin (抖音)** | Video posts, Notes, User shares | Full HD 1080p, 720p, MP3 | Handles `modal_id` links and desktop/mobile shares. **Needs fresh `.douyin.com` cookies** (no login required); exported cookies expire, so re-export when Douyin asks again. |
 | **Bilibili (哔哩哔哩)** | BV / av videos, Bangumi clips | 1080p, 720p, 480p, 360p, MP3 | Supports Netscape session cookies (`SESSDATA`) to bypass HTTP 412 verification. |
-| **XiaoHongShu (小红书)**| Video notes, shortlink shares | 1080p, 720p MP4, MP3 | Automatically distinguishes video notes from static image notes. |
+| **XiaoHongShu (小红书)**| Video notes, shortlink shares | 1080p, 720p MP4, MP3 | Use the app's **Share → Copy link** (it carries the `xsec_token` access token, which Pullio preserves). Many notes also need `.xiaohongshu.com` cookies. Image notes cannot be downloaded as video. |
 | **Pinterest** | Video pins, Board items | Original 1080p/720p MP4, MP3 | Direct MP4 stream extraction from pin metadata. |
-| **Vimeo** | Public showcase videos | 4K, 1080p, 720p, MP3 | Standard progressive MP4 and HLS stream recovery. |
+| **Vimeo** | Public and unlisted videos | 4K, 1080p, 720p, MP3 | **Needs your Vimeo cookies** (`.vimeo.com`): yt-dlp's Vimeo page client only works signed in, and the public player serves DRM-protected streams. DRM-protected streams are never offered. |
+| **Reddit** | Video posts | Source resolutions, MP3 | **Needs your Reddit cookies** (`.reddit.com`): Reddit requires account authentication for media requests. |
 | **X (Twitter)** | Video tweets, Space recordings | 1080p, 720p, 480p, MP3 | Multi-tier syndication API fallback. |
 | **SoundCloud** | Tracks, Sets, Playlists | 320kbps MP3, 256kbps, 128kbps | Audio-first extraction pipeline. |
 
@@ -103,6 +109,20 @@ npm run build
 # Start the optimized Node.js production server
 npm start
 ```
+
+`dist/server.cjs` is always built in production mode: it serves the compiled `dist/` bundle and never starts the Vite dev server, even when `NODE_ENV` is unset.
+
+### 4. Run the Checks
+
+```bash
+npm run lint
+```
+
+```bash
+npm test
+```
+
+`npm test` runs the audio studio suite and the server hardening suite (URL/SSRF validation, cross-site and DNS-rebinding guards, cookie merging, subtitle selection, quality preferences, and an end-to-end API check on temporary storage). Use `npm run test:audio` or `npm run test:server` to run one suite.
 
 ---
 
@@ -276,14 +296,41 @@ Downloads the converted media file with appropriate `Content-Disposition` and MI
 
 ### Authentication & Cookies Endpoints
 
-#### `GET /api/cookies/status`
-Returns active cookie configuration status, detected domains, file size, and timestamp.
+#### `GET /api/cookies`
+Returns `configured`, the cookie `domains`, `cookieCount`, file `size`, and `updatedAt`.
 
-#### `POST /api/cookies/upload`
-Uploads or pastes raw Netscape cookie text or browser DevTools cookie headers. The backend automatically parses and writes to `cookies.txt` with Latin-1 normalization.
+#### `POST /api/cookies`
+Body: `{ "cookies": "<Netscape cookies.txt or name=value; pairs>", "domain": ".youtube.com" }` (`domain` applies to `name=value` pairs). Cookies are sanitized to Latin-1 and merged into the file: only the domains present in the new content are replaced.
 
-#### `DELETE /api/cookies`
-Clears stored session cookies from the server filesystem.
+#### `DELETE /api/cookies` · `DELETE /api/cookies?domain=youtube.com`
+Without a domain, deletes the cookies file. With a domain, removes only that site's cookies (including subdomains).
+
+---
+
+### Engine & Subtitles Endpoints
+
+#### `GET /api/engine`
+Returns yt-dlp and FFmpeg versions, `ytDlp.ageDays` (days since the installed yt-dlp release), free/total disk space for the storage directory, the active download count, and the last update result.
+
+#### `POST /api/engine/update`
+Runs `yt-dlp --update-to stable`. Returns `409` while downloads are active. Queued downloads and new analyses wait for the update to finish.
+
+#### `GET /api/subtitles?url=…&lang=en&format=srt|vtt&auto=0|1&title=…`
+Downloads one subtitle track as a file. Use `lang` and `auto` from the `subtitles` array that `/api/analyze` returns. At most two subtitle downloads run at once.
+
+#### `GET /api/health`
+Lightweight status for uptime checks: tool availability, app version, and queue counts. It never starts a child process.
+
+---
+
+## Security Model
+
+Pullio has no user accounts. It is designed to run on your own machine (the default `HOST` is `127.0.0.1`) or behind an authenticating reverse proxy.
+
+- **Cross-site protection**: `/api` refuses requests a browser marks `Sec-Fetch-Site: cross-site`, and refuses state-changing requests whose `Origin` does not match the `Host`. WebSocket upgrades from another origin are rejected. Another website open in your browser therefore cannot queue downloads, upload files, replace cookies, or use Pullio as a proxy.
+- **DNS-rebinding protection**: When bound to loopback, only `localhost`, `127.x.x.x`, and `[::1]` host names are accepted (HTTP `421` otherwise). Behind a reverse proxy or custom domain, list your host names in `PULLIO_ALLOWED_HOSTS`.
+- **SSRF protection**: Media, short-link, subtitle, stream, and thumbnail URLs must be HTTP(S) and must not resolve to loopback, private, carrier-grade NAT, link-local/metadata, multicast, or reserved addresses. Short links are followed one hop at a time with each hop checked. The thumbnail proxy validates the address at connect time. yt-dlp follows a site's own redirects, so run Pullio on a network segment without sensitive internal services if you expose it publicly.
+- **No path disclosure**: Download and conversion responses never include server file paths, and conversion progress is only sent to clients that subscribed to that job.
 
 ---
 
@@ -328,8 +375,13 @@ Server stream response:
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PORT` | `3000` | HTTP and WebSocket server port |
-| `HOST` | `0.0.0.0` (production) / `127.0.0.1` (local) | Network interface binding |
-| `NODE_ENV` | `production` | Environment mode (`development` or `production`) |
+| `HOST` | `127.0.0.1` (`0.0.0.0` on Cloud Run) | Network interface binding. Use `0.0.0.0` in containers. |
+| `NODE_ENV` | `development` | `production` serves the built `dist/` bundle instead of the Vite dev server |
+| `PULLIO_ALLOWED_HOSTS` | *(none)* | Comma-separated host names allowed to reach the API, e.g. `media.example.com` or `.example.com` for subdomains. Required when a reverse proxy forwards a public `Host` to a loopback-bound server. |
+| `PULLIO_STORAGE_DIR` | project directory | Root for `downloads/`, `uploads/`, `converted/`, and `pullio-data/`. Use a persistent volume in containers. |
+| `PULLIO_COOKIES_FILE` | `./cookies.txt` | Netscape cookies file used for every yt-dlp call. |
+| `PULLIO_DOWNLOAD_STALL_MS` | `180000` | Fail a transfer after this long without progress (1,000–1,800,000 ms). |
+| `PULLIO_ENABLE_DEMOS` | *(off)* | `1` enables the `demo.pullio.invalid` sample URLs in development only. |
 
 ### Running with PM2 Process Manager
 
@@ -378,7 +430,7 @@ docker run -d -p 3000:3000 -v pullio_downloads:/app/downloads --name pullio pull
 
 ### Reverse Proxy Configuration (Nginx)
 
-When deploying behind Nginx, configure WebSocket proxy headers and increase maximum client body size for file uploads:
+When deploying behind Nginx, configure WebSocket proxy headers and increase maximum client body size for file uploads. Because Nginx forwards your public `Host` header, also start Pullio with `PULLIO_ALLOWED_HOSTS=media.yourdomain.com`; otherwise a loopback-bound server answers `421` to protect against DNS rebinding. Pullio has no login of its own, so add authentication at the proxy (for example `auth_basic`) before exposing it to the internet.
 
 ```nginx
 server {
@@ -411,6 +463,9 @@ server {
 ---
 
 ## Troubleshooting & FAQ
+
+#### 0. Downloads that used to work now fail ("Unable to extract", "Requested format is not available", sudden 403s)
+Platforms change their sites frequently and older yt-dlp releases stop working. Open **Settings → Download Engine**. If the release is flagged as old, pause active downloads and choose **Check for update**, then retry.
 
 #### 1. Why do Instagram or Bilibili return HTTP 412 or access errors?
 Certain platforms strictly limit guest access and enforce anti-crawler checks on server/datacenter IP ranges. 

@@ -4,12 +4,13 @@ import { formatDuration, cn, canEmbed } from '../lib/utils';
 import { 
   Download, MonitorPlay, Music, AlertCircle, ListVideo, Layers, Play, Eye, 
   Sparkles, SlidersHorizontal, Image, Subtitles, Search, CheckSquare, Square, 
-  ArrowLeftRight, FileVideo, ShieldCheck, Zap
+  ArrowLeftRight, FileVideo, ShieldCheck, Zap, Loader2
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import VideoPreviewModal from './VideoPreviewModal';
 import type { Formats } from '../types';
 import { getMediaErrorGuidance } from '../lib/mediaErrors';
+import { pickPreferredFormat } from '../lib/formats';
 
 function formatFileSize(value?: number | string): string | null {
   if (value === undefined || value === null || value === '') return null;
@@ -75,6 +76,9 @@ export default function AnalyzePanel() {
   const [playlistAudioQuality, setPlaylistAudioQuality] = useState<string>('audio-320');
   const [playlistSearch, setPlaylistSearch] = useState('');
   const [selectedSubtitle, setSelectedSubtitle] = useState<string>('');
+  const [subtitleFormat, setSubtitleFormat] = useState<'srt' | 'vtt'>('srt');
+  const [isDownloadingSubtitle, setIsDownloadingSubtitle] = useState(false);
+  const [subtitleError, setSubtitleError] = useState<string | null>(null);
 
   // Automatically select all playlist tracks when metadata loads
   React.useEffect(() => {
@@ -85,23 +89,42 @@ export default function AnalyzePanel() {
       });
       setSelectedTracks(defaultState);
     }
+    setSelectedSubtitle('');
+    setSubtitleError(null);
 
-    // Apply default format preference
+    // Apply the default quality preference to single videos.
     if (metadata && !metadata.isPlaylist && metadata.formats?.length > 0) {
-      const pref = preferences?.defaultFormat;
-      if (pref) {
-        const found = metadata.formats.find(f => String(f.itag).includes(pref));
-        if (found) {
-          setSelectedItag(found.itag);
-        } else {
-          // Default to first video or best
-          setSelectedItag(metadata.formats[0].itag);
-        }
-      } else {
-        setSelectedItag(metadata.formats[0].itag);
-      }
+      setSelectedItag(pickPreferredFormat(metadata.formats, preferences?.defaultFormat)?.itag ?? metadata.formats[0].itag);
     }
-  }, [metadata, preferences]);
+  }, [metadata, preferences?.defaultFormat]);
+
+  const handleSubtitleDownload = async () => {
+    if (!metadata || !selectedSubtitle) return;
+    const [kind, lang] = selectedSubtitle.split(/:(.*)/s);
+    setIsDownloadingSubtitle(true);
+    setSubtitleError(null);
+    try {
+      const params = new URLSearchParams({ url: metadata.url, lang, format: subtitleFormat, auto: kind === 'auto' ? '1' : '0', title: metadata.title.slice(0, 120) });
+      const response = await fetch(`/api/subtitles?${params}`, { signal: AbortSignal.timeout(150_000) });
+      if (!response.ok) {
+        const data = await response.json().catch(() => null);
+        throw new Error(data?.error || 'The subtitle track could not be downloaded.');
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get('content-disposition') || '';
+      const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+      const fileName = encodedName ? decodeURIComponent(encodedName) : disposition.match(/filename="([^"]+)"/i)?.[1] || `subtitles.${lang}.${subtitleFormat}`;
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl; link.download = fileName;
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
+    } catch (err) {
+      setSubtitleError(err instanceof Error && err.name === 'TimeoutError' ? 'The subtitle download timed out. Retry in a moment.' : err instanceof Error ? err.message : 'The subtitle track could not be downloaded.');
+    } finally {
+      setIsDownloadingSubtitle(false);
+    }
+  };
 
   // Filtered playlist items based on search query
   const filteredPlaylistItems = useMemo(() => {
@@ -205,7 +228,7 @@ export default function AnalyzePanel() {
           type: isAudio ? 'audio' : 'video',
           targetContainer,
           maxConcurrentDownloads: preferences.maxConcurrentDownloads,
-          filenameTemplate: preferences.filenameTemplate,
+          filenameTemplate: preferences.filenameTemplate, embedMetadata: preferences.embedMetadata,
           filenameQuality: selectedFormat?.quality || (isAudio ? String(targetItag) : 'best'),
         }),
       });
@@ -263,7 +286,7 @@ export default function AnalyzePanel() {
               type: isAudio ? 'audio' : 'video',
               targetContainer: isAudio ? 'mp3' : playlistVideoContainer,
               maxConcurrentDownloads: preferences.maxConcurrentDownloads,
-              filenameTemplate: preferences.filenameTemplate,
+              filenameTemplate: preferences.filenameTemplate, embedMetadata: preferences.embedMetadata,
               filenameQuality: isAudio ? String(targetItag) : String(playlistQuality),
             }),
           });
@@ -296,6 +319,7 @@ export default function AnalyzePanel() {
   const videoFormats = metadata.formats.filter(f => f.type === 'video');
   const videoOnlyFormats = metadata.formats.filter(f => f.type === 'video-only');
   const audioFormats = metadata.formats.filter(f => f.type === 'audio');
+  const hasVideoStreams = videoFormats.length > 0 || videoOnlyFormats.length > 0;
   const bestVideoFormat = videoFormats[0];
   const smallerVideoFormat = videoFormats.find(format => formatHeight(format) > 0 && formatHeight(format) <= 720)
     || videoFormats[videoFormats.length - 1];
@@ -322,7 +346,7 @@ export default function AnalyzePanel() {
             <div>
               <div className="relative rounded-[10px] overflow-hidden aspect-video bg-black/40 border border-white/5 group mb-4">
                 {metadata.thumbnail ? (
-                  <img src={metadata.thumbnail} alt={metadata.title} className="w-full h-full object-cover opacity-75 group-hover:scale-105 transition-transform duration-700" />
+                  <img referrerPolicy="no-referrer" src={metadata.thumbnail} alt={metadata.title} className="w-full h-full object-cover opacity-75 group-hover:scale-105 transition-transform duration-700" />
                 ) : (
                   <div className="flex items-center justify-center w-full h-full text-neutral-500">
                     <AlertCircle className="size-8 opacity-50" />
@@ -536,7 +560,7 @@ export default function AnalyzePanel() {
                         {i + 1}
                       </div>
                       <div className="size-11 sm:size-12 rounded-[6px] overflow-hidden bg-black shrink-0 relative border border-white/5">
-                        <img src={track.thumbnail} alt={track.title} className="w-full h-full object-cover opacity-80" />
+                        <img referrerPolicy="no-referrer" src={track.thumbnail} alt={track.title} className="w-full h-full object-cover opacity-80" />
                         <div className="absolute bottom-0.5 right-0.5 bg-black/90 px-1 py-0.2 rounded text-[7px] font-mono text-gray-400">
                           {formatDuration(track.duration)}
                         </div>
@@ -597,7 +621,7 @@ export default function AnalyzePanel() {
                 title="Click to preview"
               >
                 {metadata.thumbnail ? (
-                  <img
+                  <img referrerPolicy="no-referrer"
                     src={metadata.thumbnail}
                     alt={metadata.title}
                     className="w-full h-full object-cover opacity-70 group-hover:opacity-90 group-hover:scale-105 transition-all duration-700"
@@ -701,36 +725,53 @@ export default function AnalyzePanel() {
                 </div>
               </div>
 
-              {/* Subtitles Track Bar if available */}
+              {/* Subtitles: downloaded through the server as a real SRT/VTT file */}
               {metadata.subtitles && metadata.subtitles.length > 0 && (
-                <div className="p-3 bg-white/5 border border-white/5 rounded-[8px] flex items-center justify-between gap-3 text-xs">
-                  <div className="flex items-center gap-2 text-gray-300">
-                    <Subtitles className="size-4 text-[var(--accent)]" />
-                    <span className="font-bold text-[11px] uppercase tracking-wide">Subtitles:</span>
-                    <span className="text-gray-400 text-[11px]">{metadata.subtitles.length} tracks detected</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <select
-                      value={selectedSubtitle}
-                      onChange={(e) => setSelectedSubtitle(e.target.value)}
-                      className="bg-black/60 border border-white/10 rounded-[6px] px-2 py-1 text-[10px] font-mono text-gray-200 outline-none"
-                    >
-                      <option value="">Select Language</option>
-                      {metadata.subtitles.map(sub => (
-                        <option key={sub.lang} value={sub.url || sub.lang}>{sub.name || sub.lang}</option>
-                      ))}
-                    </select>
-                    {selectedSubtitle && (
-                      <a
-                        href={selectedSubtitle}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="px-2 py-1 bg-white/10 hover:bg-white/20 rounded-[6px] text-[10px] font-bold uppercase text-white"
+                <div className="p-3 bg-white/5 border border-white/5 rounded-[8px] flex flex-col gap-2 text-xs">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-gray-300">
+                      <Subtitles className="size-4 text-[var(--accent)]" />
+                      <span className="font-bold text-[11px] uppercase tracking-wide">Subtitles</span>
+                      <span className="text-gray-400 text-[11px]">{metadata.subtitles.length} track{metadata.subtitles.length === 1 ? '' : 's'}</span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <label htmlFor="subtitle-track" className="sr-only">Subtitle language</label>
+                      <select
+                        id="subtitle-track"
+                        value={selectedSubtitle}
+                        onChange={(e) => { setSelectedSubtitle(e.target.value); setSubtitleError(null); }}
+                        className="min-w-0 max-w-[14rem] bg-black/60 border border-white/10 rounded-[6px] px-2 py-1 text-[11px] text-gray-200 outline-none focus:border-[var(--accent)]"
                       >
-                        Download
-                      </a>
-                    )}
+                        <option value="">Choose a language</option>
+                        {metadata.subtitles.map(sub => (
+                          <option key={`${sub.auto ? 'auto' : 'sub'}:${sub.lang}`} value={`${sub.auto ? 'auto' : 'sub'}:${sub.lang}`}>{sub.name || sub.lang}</option>
+                        ))}
+                      </select>
+                      <div className="flex items-center bg-black/60 border border-white/10 rounded-[6px] p-0.5" role="group" aria-label="Subtitle file format">
+                        {(['srt', 'vtt'] as const).map((format) => (
+                          <button
+                            key={format}
+                            type="button"
+                            onClick={() => setSubtitleFormat(format)}
+                            aria-pressed={subtitleFormat === format}
+                            className={cn("px-2 py-0.5 rounded-[4px] text-[10px] font-bold uppercase cursor-pointer", subtitleFormat === format ? "bg-white/15 text-white" : "text-gray-400 hover:text-white")}
+                          >
+                            {format}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void handleSubtitleDownload()}
+                        disabled={!selectedSubtitle || isDownloadingSubtitle}
+                        className="px-2.5 py-1 bg-white/10 hover:bg-white/20 rounded-[6px] text-[10px] font-bold uppercase text-white cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1"
+                      >
+                        {isDownloadingSubtitle ? <Loader2 className="size-3 animate-spin" /> : <Download className="size-3" />}
+                        {isDownloadingSubtitle ? 'Preparing…' : 'Download'}
+                      </button>
+                    </div>
                   </div>
+                  {subtitleError && <p className="text-[11px] text-red-300" role="alert">{subtitleError}</p>}
                 </div>
               )}
 
@@ -740,6 +781,7 @@ export default function AnalyzePanel() {
                 <div className="p-2.5 bg-gradient-to-r from-[var(--accent)]/10 via-purple-500/10 to-indigo-500/10 border border-[var(--accent)]/25 rounded-[10px]">
                   <p className="text-[9px] text-gray-400 font-bold uppercase tracking-widest mb-2">Quick download presets</p>
                   <div className="grid grid-cols-1 gap-2">
+                    {hasVideoStreams && <>
                     <button
                       onClick={() => {
                         const itag = bestVideoFormat?.itag || 'best';
@@ -767,6 +809,7 @@ export default function AnalyzePanel() {
                       <MonitorPlay className="size-4 text-[var(--accent)] shrink-0" />
                       <span className="text-left leading-snug">Smaller video · {smallerVideoFormat ? conciseQuality(smallerVideoFormat.quality) : 'unavailable'}</span>
                     </button>
+                    </>}
 
                     <button
                       onClick={() => {
@@ -785,8 +828,8 @@ export default function AnalyzePanel() {
                   <p className="text-[9px] text-gray-500 mt-2">Presets start the download immediately. Use the format list below to review options first.</p>
                 </div>
 
-                {/* 1. Merged Video + Audio (High Quality) */}
-                <div>
+                {/* 1. Merged Video + Audio (High Quality) — hidden for audio-only sources */}
+                {hasVideoStreams && <div>
                    <h4 className="text-xs font-bold uppercase tracking-widest text-gray-400 mb-2 flex items-center gap-2">
                      <MonitorPlay className="size-4 text-[var(--accent)]" /> 
                      {mode === 'smart' ? 'Best Quality (Video + Audio Merged)' : 'Video Streams with FFmpeg Audio Merge'}
@@ -830,7 +873,7 @@ export default function AnalyzePanel() {
                         </button>
                       )) : <span className="text-xs text-neutral-500">None available</span>}
                    </div>
-                </div>
+                </div>}
 
                 {/* 2. Audio Extraction */}
                 <div>

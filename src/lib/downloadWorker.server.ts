@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ChildProcess, spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
-import { DownloadRecord, DownloadStage, decodeDownloadProgress, postprocessStage } from './downloads';
+import { DownloadRecord, DownloadStage, decodeDownloadProgress, metadataEmbedArgs, postprocessStage } from './downloads';
 import { StallWatchdog } from './downloadJournal.server';
 
 // Missing yt-dlp fields otherwise render as bare NA, which is not valid JSON.
@@ -13,15 +13,21 @@ export async function runDownloadWorker(job: DownloadRecord, options: {
   directory: string; executable: string; format: string; runtimeArgs: string[]; ffmpeg: string; ffmpegDirectory: string;
   demo: boolean; processes: Map<string, any>; current: () => boolean; update: (force?: boolean) => void;
   stop: () => Promise<void>; complete: (filePath: string) => void;
+  metadata?: (meta: { title?: unknown; thumbnail?: unknown; uploader?: unknown }) => void;
 }) {
   job.stage = options.demo ? 'converting' : 'extracting'; job.stageProgress = undefined;
   job.speed = 'Starting…'; job.eta = '--:--'; options.update(true);
   const out = path.join(options.directory, `${job.jobId}.%(ext)s`);
   const args = ['--newline', '--progress', '--no-playlist', '--no-warnings', '--continue', '--part', '--no-mtime',
     '--socket-timeout', '30', '--retries', '3', '--fragment-retries', '3',
+    // Fetch HLS/DASH fragments in parallel; single-file downloads are unaffected.
+    '--concurrent-fragments', '4',
     '--progress-template', PROGRESS_TEMPLATE,
     '--progress-template', 'postprocess:__PULLIO_POST__{"postprocessor":%(progress.postprocessor|null)j,"status":%(progress.status|null)j}',
-    '--print', 'after_move:__PULLIO_FILE__%(filepath)j', ...options.runtimeArgs, '-f', options.format, '-o', out];
+    '--print', 'after_move:__PULLIO_FILE__%(filepath)j',
+    // Real title/thumbnail, so links queued without analysis (batch, retries) get proper names.
+    '--print', 'before_dl:__PULLIO_META__%(.{title,thumbnail,uploader})j',
+    ...options.runtimeArgs, '-f', options.format, '-o', out];
   if (options.ffmpegDirectory) args.push('--ffmpeg-location', options.ffmpegDirectory);
   const originalAudio = String(job.itag).toLowerCase().startsWith('yt:audio-source:');
   if (job.type === 'audio' && !originalAudio && options.ffmpegDirectory) {
@@ -30,6 +36,7 @@ export async function runDownloadWorker(job: DownloadRecord, options: {
   } else if (job.type === 'video' && options.ffmpegDirectory) {
     args.push('--merge-output-format', job.targetContainer || 'mkv', '--remux-video', job.targetContainer || 'mkv');
   }
+  if (options.ffmpegDirectory) args.push(...metadataEmbedArgs(job));
   args.push('--', job.url);
   const demoFile = path.join(options.directory, `${job.jobId}.${job.targetContainer || (job.type === 'audio' ? 'mp3' : 'mp4')}`);
   const demoVideoEncoder = job.targetContainer === 'webm' ? ['-c:v', 'libvpx', '-deadline', 'realtime', '-c:a', 'libopus'] : ['-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac'];
@@ -88,6 +95,14 @@ export async function runDownloadWorker(job: DownloadRecord, options: {
     }
     const post = postprocessStage(line);
     if (post) { stage(post); job.progress = Math.max(job.progress, post === 'merging' ? 82 : post === 'converting' ? 88 : 96); return; }
+    const metaMarker = '__PULLIO_META__';
+    if (line.includes(metaMarker)) {
+      try {
+        const meta = JSON.parse(line.slice(line.indexOf(metaMarker) + metaMarker.length));
+        if (meta && typeof meta === 'object') options.metadata?.(meta);
+      } catch {}
+      return;
+    }
     const marker = '__PULLIO_FILE__';
     if (line.includes(marker)) {
       try { reportedFile = JSON.parse(line.slice(line.indexOf(marker) + marker.length)); } catch {}

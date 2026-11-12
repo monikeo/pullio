@@ -147,8 +147,9 @@ export default function ConverterPanel() {
       const ext = nameParts.length > 1 ? nameParts.pop()!.toLowerCase() : '';
       const mediaType = detectType(ext);
 
-      // Default target: if video, offer MP3 audio extraction or MP4; if audio, offer MP3
-      const defaultTarget: TargetMediaFormat = mediaType === 'video' ? 'mp3' : 'wav';
+      // Default target: extract MP3 from video; convert audio to MP3, or MP3 to WAV, so the
+      // default is never a same-format "conversion".
+      const defaultTarget: TargetMediaFormat = mediaType === 'audio' && ext === 'mp3' ? 'wav' : 'mp3';
 
       const item: ConversionItem = {
         id: crypto.randomUUID(),

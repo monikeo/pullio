@@ -13,7 +13,8 @@ export const ALLOWED_MEDIA_EXTENSIONS = new Set([
 export const DANGEROUS_EXTENSIONS = new Set([
   'exe', 'bat', 'cmd', 'sh', 'bash', 'bin', 'msi', 'com', 'scr', 'pif',
   'php', 'php3', 'php4', 'php5', 'phtml', 'asp', 'aspx', 'jsp', 'cgi', 'pl',
-  'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'html', 'htm', 'xhtml', 'svg',
+  // `.ts` is deliberately absent: it is also the MPEG transport-stream video container.
+  'js', 'jsx', 'tsx', 'mjs', 'cjs', 'html', 'htm', 'xhtml', 'svg',
   'vbs', 'vbe', 'wsf', 'wsh', 'ps1', 'psm1', 'jar', 'apk', 'iso', 'dll'
 ]);
 
@@ -208,11 +209,12 @@ export function sanitizeUserPreferences(raw: any): UserPreferences {
     filenameTemplate: '{title} - {platform}',
     autoAnalyzeOnPaste: true,
     notifyOnComplete: true,
+    embedMetadata: true,
   };
 
   if (!raw || typeof raw !== 'object') return defaults;
 
-  const allowedFormats = ['best', '1080p', '720p', '480p', '360p', 'audio-320', 'audio-128'];
+  const allowedFormats = ['best', '2160p', '1440p', '1080p', '720p', '480p', '360p', 'audio-320', 'audio-128'];
   const allowedContainers = ['mp4', 'mkv', 'webm', 'mp3'];
   const allowedConcurrentDownloadLimits = [1, 2, 3, 4];
 
@@ -225,5 +227,6 @@ export function sanitizeUserPreferences(raw: any): UserPreferences {
       : defaults.filenameTemplate,
     autoAnalyzeOnPaste: Boolean(raw.autoAnalyzeOnPaste),
     notifyOnComplete: Boolean(raw.notifyOnComplete),
+    embedMetadata: raw.embedMetadata === undefined ? defaults.embedMetadata : Boolean(raw.embedMetadata),
   };
 }

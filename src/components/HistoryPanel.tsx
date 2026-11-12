@@ -16,9 +16,10 @@ export default function HistoryPanel() {
   const handleCopy = (url: string, id: string) => {
     const safe = sanitizeUrl(url);
     if (safe !== '#') {
-      navigator.clipboard.writeText(safe);
-      setCopiedId(id);
-      setTimeout(() => setCopiedId(null), 2000);
+      navigator.clipboard?.writeText(safe).then(() => {
+        setCopiedId(id);
+        setTimeout(() => setCopiedId(null), 2000);
+      }).catch(() => { /* Clipboard permission denied: leave the button unchanged. */ });
     }
   };
 
@@ -144,7 +145,7 @@ export default function HistoryPanel() {
                     {/* Thumbnail */}
                     <div className="size-14 rounded-[8px] overflow-hidden bg-black/60 shrink-0 relative border border-white/10">
                       {item.thumbnail ? (
-                        <img src={item.thumbnail} alt={item.title} className="w-full h-full object-cover" />
+                        <img referrerPolicy="no-referrer" src={item.thumbnail} alt={item.title} className="w-full h-full object-cover" />
                       ) : (
                         <div className="w-full h-full flex items-center justify-center text-gray-500">
                           {item.type === 'audio' ? <Music className="size-5" /> : <Video className="size-5" />}

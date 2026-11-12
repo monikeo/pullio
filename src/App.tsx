@@ -35,7 +35,7 @@ function PanelLoading() {
 const SAMPLE_LINKS = [
   { label: 'YouTube 4K 60fps', url: 'https://www.youtube.com/watch?v=aqz-KE-bpKQ' },
   { label: 'YouTube Music Track', url: 'https://www.youtube.com/watch?v=kJQP7kiw5Fk' },
-  { label: 'Vimeo Showcase', url: 'https://vimeo.com/76979871' },
+  { label: 'TikTok Clip', url: 'https://www.tiktok.com/@scout2015/video/6718335390845095173' },
   { label: 'Public Domain MP3', url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3' }
 ];
 
@@ -254,7 +254,7 @@ export default function App() {
           quality: preferences?.defaultFormat || '1080p',
           type: preferences?.defaultFormat?.startsWith('audio-') ? 'audio' : 'video',
           maxConcurrentDownloads: preferences.maxConcurrentDownloads,
-          filenameTemplate: preferences.filenameTemplate,
+          filenameTemplate: preferences.filenameTemplate, embedMetadata: preferences.embedMetadata,
           filenameQuality: preferences?.defaultFormat || 'best',
         }),
         signal: controller.signal,
@@ -417,7 +417,7 @@ export default function App() {
                 type: isAudio ? 'audio' : 'video',
                 targetContainer,
                 maxConcurrentDownloads: preferences.maxConcurrentDownloads,
-                filenameTemplate: preferences.filenameTemplate,
+                filenameTemplate: preferences.filenameTemplate, embedMetadata: preferences.embedMetadata,
                 filenameQuality: preferredFormat,
               }),
             });
@@ -536,10 +536,15 @@ export default function App() {
     window.addEventListener('unhandledrejection', handleUnhandledRejection);
 
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
-      if (e.key === '/' && document.activeElement !== searchInputRef.current) {
-        e.preventDefault();
-        searchInputRef.current?.focus();
-      }
+      if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented) return;
+      // Never hijack "/" while the user is typing in a field (cookie text, templates, batch links…).
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return;
+      if (searchInputRef.current && document.activeElement === searchInputRef.current) return;
+      e.preventDefault();
+      // The search box only exists on the Downloader tab, so switch there first.
+      if (useAppStore.getState().activeTab !== 'downloader') setActiveTab('downloader');
+      setTimeout(() => searchInputRef.current?.focus(), 50);
     };
     window.addEventListener('keydown', handleGlobalKeyDown);
 
@@ -584,6 +589,14 @@ export default function App() {
   useEffect(() => {
     document.documentElement.setAttribute('data-provider', provider);
   }, [provider]);
+
+  // Show overall transfer progress in the tab title so it is visible from other tabs.
+  useEffect(() => {
+    const running = Object.values(activeJobs).filter((job) => job.status === 'downloading' || job.status === 'queued');
+    if (!running.length) { document.title = 'Pullio · Universal Media Downloader & Converter'; return; }
+    const average = Math.round(running.reduce((total, job) => total + (job.progress || 0), 0) / running.length);
+    document.title = `(${running.length}) ${average}% · Pullio`;
+  }, [activeJobs]);
 
   return (
       <div className="min-h-screen flex flex-col relative font-sans overflow-x-clip selection:bg-[var(--accent)] selection:text-black bg-[#030303] text-neutral-100">

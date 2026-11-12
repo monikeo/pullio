@@ -1,5 +1,5 @@
-// Pullio Production PWA Service Worker v6
-const CACHE_VERSION = 'v6';
+// Pullio Production PWA Service Worker v7
+const CACHE_VERSION = 'v7';
 const STATIC_CACHE = `pullio-static-${CACHE_VERSION}`;
 const DYNAMIC_CACHE = `pullio-dynamic-${CACHE_VERSION}`;
 const MAX_DYNAMIC_ENTRIES = 50;
@@ -57,6 +57,20 @@ self.addEventListener('message', (event) => {
   if (event.data && event.data.type === 'SKIP_WAITING') {
     self.skipWaiting();
   }
+});
+
+// Focus an open Pullio window (or open one) when a download/conversion notification is clicked.
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const target = new URL((event.notification.data && event.notification.data.url) || '/?tab=transfers', self.location.origin);
+  if (target.origin !== self.location.origin) return;
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windows) => {
+      const existing = windows.find((client) => new URL(client.url).origin === self.location.origin);
+      if (existing) return existing.focus();
+      return self.clients.openWindow(target.href);
+    })
+  );
 });
 
 self.addEventListener('fetch', (event) => {
